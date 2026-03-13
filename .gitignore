@@ -1,2 +1,20 @@
+# Python 自动生成的缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境 (非常重要，不要上传几千个依赖包)
+venv/
+.venv/
+env/
+
+# 环境变量 (保护你的私密 Key)
 .env
-.env
+
+# 操作系统临时文件
+.DS_Store
+Thumbs.db
+
+# 硬件/IDE 产生的特定文件
+.vscode/
+.idea/
