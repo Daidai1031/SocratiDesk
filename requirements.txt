@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+google-genai==1.67.0
+python-dotenv
+pydantic
