@@ -250,7 +250,7 @@ python main.py
 
 | Phase | Trigger | Tutor Behavior |
 |---|---|---|
-| `greeting` | User says "Hi SocratiDesk" | Greets warmly, asks "Do you have a textbook?" |
+| `greeting` | User says "Hi Socrati/Socratic" | Greets warmly, asks "Do you have a textbook?" |
 | `awaiting_mode` | After greeting | Listens for "yes" or "no" |
 | `awaiting_upload` | User says "yes" + no book uploaded | Says "Scan the QR code", Pi shows QR |
 | `textbook_ready` | Book uploaded or already available | Confirms book received, asks first question |
