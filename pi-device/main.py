@@ -16,11 +16,11 @@ from audio import MicStreamer, SpeakerPlayer
 # ── Server URL (override via env) ──
 WS_URL = os.getenv(
     "SOCRATIDESK_WS",
-    "wss://live-server-3234073392.us-central1.run.app/live",
+    "wss://live-server-azyjn6tlia-uc.a.run.app/live",
 )
 HTTP_URL = os.getenv(
     "SOCRATIDESK_HTTP",
-    "https://live-server-3234073392.us-central1.run.app",
+    "https://live-server-azyjn6tlia-uc.a.run.app",
 )
 
 
