@@ -2,3 +2,7 @@ fastapi==0.116.1
 uvicorn[standard]==0.35.0
 google-genai==1.67.0
 websockets==16.0
+pdfplumber==0.11.6
+python-multipart==0.0.20
+google-cloud-firestore==2.20.1
+google-cloud-storage==2.19.0

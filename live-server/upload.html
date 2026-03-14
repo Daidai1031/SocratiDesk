@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>SocratiDesk — Upload Textbook</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,700;1,9..40,400&family=Fraunces:ital,opsz,wght@0,9..144,600;1,9..144,400&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#faf8f5;--card:#ffffff;--text:#1a1612;--sub:#7a7064;
+  --accent:#1d6b52;--accent-light:#e8f5ee;--accent-glow:#2ecc71;
+  --border:#e8e4de;--danger:#c0392b;--radius:16px;
+  --font-body:'DM Sans',system-ui,sans-serif;
+  --font-display:'Fraunces','Georgia',serif;
+}
+html{font-size:16px;-webkit-text-size-adjust:100%}
+body{
+  font-family:var(--font-body);color:var(--text);background:var(--bg);
+  min-height:100dvh;display:flex;flex-direction:column;align-items:center;
+  padding:24px 16px 48px;
+}
+
+/* ── Header ── */
+.brand{text-align:center;margin-bottom:32px}
+.brand-icon{
+  width:56px;height:56px;border-radius:14px;
+  background:var(--accent);display:inline-flex;align-items:center;justify-content:center;
+  margin-bottom:12px;
+  box-shadow:0 4px 20px rgba(29,107,82,.25);
+}
+.brand-icon svg{width:28px;height:28px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.brand h1{
+  font-family:var(--font-display);font-weight:600;font-size:1.5rem;
+  letter-spacing:-.02em;color:var(--text);margin-bottom:4px;
+}
+.brand p{font-size:.875rem;color:var(--sub);line-height:1.5}
+
+/* ── Card ── */
+.upload-card{
+  width:100%;max-width:400px;background:var(--card);
+  border:1px solid var(--border);border-radius:var(--radius);
+  padding:24px;
+  box-shadow:0 1px 3px rgba(0,0,0,.04),0 8px 32px rgba(0,0,0,.04);
+}
+
+/* ── Drop zone ── */
+.dropzone{
+  border:2px dashed var(--border);border-radius:12px;
+  padding:40px 20px;text-align:center;cursor:pointer;
+  transition:border-color .2s,background .2s;
+  position:relative;overflow:hidden;
+}
+.dropzone:hover,.dropzone.dragover{
+  border-color:var(--accent);background:var(--accent-light);
+}
+.dropzone-icon{
+  width:48px;height:48px;margin:0 auto 12px;border-radius:12px;
+  background:var(--accent-light);display:flex;align-items:center;justify-content:center;
+}
+.dropzone-icon svg{width:24px;height:24px;stroke:var(--accent);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.dropzone-text{font-size:.9375rem;font-weight:500;color:var(--text);margin-bottom:4px}
+.dropzone-sub{font-size:.8125rem;color:var(--sub)}
+.dropzone input{
+  position:absolute;inset:0;opacity:0;cursor:pointer;
+}
+
+/* ── File preview ── */
+.file-preview{
+  display:none;margin-top:16px;padding:14px 16px;
+  background:#f8f6f3;border-radius:10px;
+  align-items:center;gap:12px;
+}
+.file-preview.visible{display:flex}
+.file-icon{
+  width:40px;height:40px;border-radius:8px;flex-shrink:0;
+  background:var(--accent);display:flex;align-items:center;justify-content:center;
+  font-size:.75rem;font-weight:700;color:#fff;letter-spacing:.02em;
+}
+.file-info{flex:1;min-width:0}
+.file-name{font-size:.875rem;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file-size{font-size:.75rem;color:var(--sub);margin-top:2px}
+.file-remove{
+  width:28px;height:28px;border-radius:50%;border:none;cursor:pointer;
+  background:transparent;color:var(--sub);font-size:1.1rem;
+  display:flex;align-items:center;justify-content:center;
+  transition:background .15s,color .15s;
+}
+.file-remove:hover{background:#ece8e2;color:var(--danger)}
+
+/* ── Upload button ── */
+.upload-btn{
+  display:none;width:100%;margin-top:16px;padding:14px;
+  border:none;border-radius:10px;cursor:pointer;
+  font-family:var(--font-body);font-size:.9375rem;font-weight:600;
+  color:#fff;background:var(--accent);
+  transition:background .15s,transform .1s,box-shadow .15s;
+  box-shadow:0 2px 8px rgba(29,107,82,.2);
+}
+.upload-btn.visible{display:block}
+.upload-btn:hover{background:#18594a;box-shadow:0 4px 16px rgba(29,107,82,.3)}
+.upload-btn:active{transform:scale(.98)}
+.upload-btn:disabled{opacity:.6;cursor:not-allowed;transform:none}
+
+/* ── Progress ── */
+.progress-wrap{display:none;margin-top:16px}
+.progress-wrap.visible{display:block}
+.progress-bar{
+  height:6px;border-radius:3px;background:#e8e4de;overflow:hidden;
+}
+.progress-fill{
+  height:100%;width:0;border-radius:3px;
+  background:linear-gradient(90deg,var(--accent),var(--accent-glow));
+  transition:width .3s ease;
+}
+.progress-text{font-size:.75rem;color:var(--sub);margin-top:8px;text-align:center}
+
+/* ── Status ── */
+.status{
+  display:none;margin-top:20px;padding:16px;border-radius:12px;text-align:center;
+  font-size:.875rem;line-height:1.5;
+}
+.status.visible{display:block}
+.status.success{background:#e8f5ee;color:#15603e}
+.status.error{background:#fce8e6;color:#922820}
+.status .status-emoji{font-size:1.5rem;display:block;margin-bottom:8px}
+.status .status-title{font-weight:600;margin-bottom:2px}
+
+/* ── Session info ── */
+.session-info{
+  margin-top:24px;padding-top:20px;border-top:1px solid var(--border);
+  text-align:center;
+}
+.session-badge{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:6px 14px;border-radius:20px;
+  background:#f0ede8;font-size:.75rem;color:var(--sub);font-weight:500;
+}
+.session-dot{
+  width:7px;height:7px;border-radius:50%;
+  background:#ccc;
+}
+.session-dot.connected{background:var(--accent-glow);box-shadow:0 0 6px rgba(46,204,113,.5)}
+
+/* ── Animation ── */
+@keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.brand{animation:fadeUp .5s ease both}
+.upload-card{animation:fadeUp .5s ease .1s both}
+</style>
+</head>
+<body>
+
+<div class="brand">
+  <div class="brand-icon">
+    <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+  </div>
+  <h1>SocratiDesk</h1>
+  <p>Upload your textbook to start guided study</p>
+</div>
+
+<div class="upload-card">
+  <div class="dropzone" id="dropzone">
+    <div class="dropzone-icon">
+      <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    </div>
+    <div class="dropzone-text">Tap to select PDF</div>
+    <div class="dropzone-sub">or drag & drop your textbook here</div>
+    <input type="file" id="fileInput" accept=".pdf,.txt,.md">
+  </div>
+
+  <div class="file-preview" id="filePreview">
+    <div class="file-icon">PDF</div>
+    <div class="file-info">
+      <div class="file-name" id="fileName"></div>
+      <div class="file-size" id="fileSize"></div>
+    </div>
+    <button class="file-remove" id="fileRemove" title="Remove">&times;</button>
+  </div>
+
+  <button class="upload-btn" id="uploadBtn">Upload to SocratiDesk</button>
+
+  <div class="progress-wrap" id="progressWrap">
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="progress-text" id="progressText">Uploading...</div>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <div class="session-info">
+    <div class="session-badge">
+      <span class="session-dot" id="sessionDot"></span>
+      <span id="sessionLabel">Connecting to device...</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const SESSION_ID = new URLSearchParams(window.location.search).get('session') || 'default';
+const API_BASE = window.location.origin;
+
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const filePreview = document.getElementById('filePreview');
+const fileName = document.getElementById('fileName');
+const fileSize = document.getElementById('fileSize');
+const fileRemove = document.getElementById('fileRemove');
+const uploadBtn = document.getElementById('uploadBtn');
+const progressWrap = document.getElementById('progressWrap');
+const progressFill = document.getElementById('progressFill');
+const progressText = document.getElementById('progressText');
+const statusEl = document.getElementById('status');
+const sessionDot = document.getElementById('sessionDot');
+const sessionLabel = document.getElementById('sessionLabel');
+
+let selectedFile = null;
+
+// ── WebSocket for device notification ──
+let notifyWs = null;
+
+function connectNotify() {
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${wsProto}//${location.host}/upload-notify?session=${SESSION_ID}`;
+  try {
+    notifyWs = new WebSocket(wsUrl);
+    notifyWs.onopen = () => {
+      sessionDot.classList.add('connected');
+      sessionLabel.textContent = 'Device connected';
+    };
+    notifyWs.onclose = () => {
+      sessionDot.classList.remove('connected');
+      sessionLabel.textContent = 'Device disconnected';
+      setTimeout(connectNotify, 3000);
+    };
+    notifyWs.onerror = () => {
+      sessionDot.classList.remove('connected');
+      sessionLabel.textContent = 'Connection error';
+    };
+  } catch(e) {
+    sessionLabel.textContent = 'WebSocket unavailable';
+  }
+}
+connectNotify();
+
+// ── File selection ──
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/(1024*1024)).toFixed(1) + ' MB';
+}
+
+function selectFile(file) {
+  if (!file) return;
+  const ext = file.name.split('.').pop().toLowerCase();
+  if (!['pdf','txt','md'].includes(ext)) {
+    showStatus('error', 'Unsupported file type. Please upload a PDF, TXT, or MD file.');
+    return;
+  }
+  if (file.size > 50 * 1024 * 1024) {
+    showStatus('error', 'File too large. Maximum size is 50 MB.');
+    return;
+  }
+  selectedFile = file;
+  fileName.textContent = file.name;
+  fileSize.textContent = formatSize(file.size);
+  filePreview.classList.add('visible');
+  uploadBtn.classList.add('visible');
+  statusEl.classList.remove('visible');
+}
+
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) selectFile(e.target.files[0]);
+});
+
+fileRemove.addEventListener('click', () => {
+  selectedFile = null;
+  fileInput.value = '';
+  filePreview.classList.remove('visible');
+  uploadBtn.classList.remove('visible');
+});
+
+// Drag and drop
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) selectFile(e.dataTransfer.files[0]);
+});
+
+// ── Upload ──
+uploadBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = 'Uploading...';
+  progressWrap.classList.add('visible');
+  statusEl.classList.remove('visible');
+  progressFill.style.width = '0%';
+
+  const formData = new FormData();
+  formData.append('file', selectedFile);
+
+  try {
+    // Use XMLHttpRequest for progress tracking
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+
+      xhr.upload.addEventListener('progress', e => {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 90);
+          progressFill.style.width = pct + '%';
+          progressText.textContent = `Uploading... ${pct}%`;
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        if (xhr.status === 200) {
+          progressFill.style.width = '100%';
+          progressText.textContent = 'Processing...';
+
+          const result = JSON.parse(xhr.responseText);
+
+          // Notify Pi device via WebSocket
+          if (notifyWs && notifyWs.readyState === WebSocket.OPEN) {
+            notifyWs.send(JSON.stringify({
+              type: 'textbook_uploaded',
+              book_id: result.book_id,
+              name: result.name,
+              pages: result.pages,
+              chunks: result.chunks,
+            }));
+          }
+
+          setTimeout(() => {
+            progressWrap.classList.remove('visible');
+            showStatus('success',
+              `"${result.name}" uploaded successfully!<br>` +
+              `${result.pages} pages, ${result.chunks} study chunks created.<br>` +
+              `<strong>Go back to your SocratiDesk and say "textbook mode"!</strong>`
+            );
+          }, 500);
+
+          resolve();
+        } else {
+          const err = JSON.parse(xhr.responseText);
+          reject(new Error(err.error || 'Upload failed'));
+        }
+      });
+
+      xhr.addEventListener('error', () => reject(new Error('Network error')));
+      xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+
+      xhr.open('POST', `${API_BASE}/upload-textbook`);
+      xhr.send(formData);
+    });
+
+  } catch (err) {
+    progressWrap.classList.remove('visible');
+    showStatus('error', err.message);
+  } finally {
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = 'Upload to SocratiDesk';
+  }
+});
+
+function showStatus(type, html) {
+  statusEl.className = `status visible ${type}`;
+  const emoji = type === 'success' ? '&#x1F4DA;' : '&#x26A0;&#xFE0F;';
+  statusEl.innerHTML = `<span class="status-emoji">${emoji}</span>${html}`;
+}
+</script>
+</body>
+</html>
