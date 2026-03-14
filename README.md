@@ -27,7 +27,7 @@ The device has no keyboard, no browser, no distractions. Just a microphone, a sp
 ## User Flow
 
 ```
-Student: "Hey SocratiDesk!"
+Student: "Hey SocratiDesk/Socrati/Socratic!"
 Tutor:   "Hey there! Do you have a textbook you'd like to study with today?"
 
          ┌─── "Yes, I have a book" ──────────────────────┐
