@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -13,47 +14,430 @@ import websockets
 
 from audio import MicStreamer, SpeakerPlayer
 
-# ── Server URL (override via env) ──
+# ── Server URL ──
 WS_URL = os.getenv(
     "SOCRATIDESK_WS",
-    "wss://live-server-azyjn6tlia-uc.a.run.app/live",
+    "wss://live-server-3234073392.us-central1.run.app/live",
 )
 HTTP_URL = os.getenv(
     "SOCRATIDESK_HTTP",
-    "https://live-server-azyjn6tlia-uc.a.run.app",
+    "https://live-server-3234073392.us-central1.run.app",
+)
+DEVICE_ID = os.getenv("DEVICE_ID", "socratiDesk-001")
+
+# Vosk model path
+VOSK_MODEL_PATH = os.getenv(
+    "VOSK_MODEL_PATH",
+    str(Path(__file__).parent.parent / "models" / "vosk-model-s"),
 )
 
+# ── Phase constants ──
+PHASE_IDLE            = "idle"
+PHASE_GREETING        = "greeting"
+PHASE_AWAITING_MODE   = "awaiting_mode"
+PHASE_AWAITING_UPLOAD = "awaiting_upload"
+PHASE_TEXTBOOK_READY  = "textbook_ready"
+PHASE_TEXTBOOK        = "textbook"
+PHASE_CURIOSITY       = "curiosity"
+
+WAKE_WORDS = [
+    "socrati", "socratic", "socratidesk",
+    "hey socrati", "hi socrati", "hello socrati",
+    "hey socratic", "hi socratic",
+    "sock righty", "sock rati", "so crazy",
+]
+
+
+# ═══════════════════════════════════════════
+# Vosk Wake Word Detector
+# ═══════════════════════════════════════════
+
+class VoskWakeWord:
+    """Wake word detector that shares audio chunks from MicStreamer.
+    Does NOT open its own sounddevice stream — avoids device conflict.
+    Call feed(chunk) from mic_sender to pass audio in.
+    """
+
+    def __init__(self, model_path: str, wake_callback, response_callback=None):
+        self.model_path = model_path
+        self.wake_callback = wake_callback
+        self.response_callback = response_callback  # called with "yes" or "no"
+        self._paused = False
+        self._available = False
+        self._rec = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        try:
+            from vosk import Model, KaldiRecognizer
+            self._model = Model(self.model_path)
+            self._rec = KaldiRecognizer(self._model, 16000)
+            self._rec.SetWords(False)
+            self._KaldiRecognizer = KaldiRecognizer
+            self._available = True
+            print("[VOSK] Wake word detector ready (sharing mic stream)")
+        except Exception as e:
+            print(f"[VOSK] Not available: {e}")
+
+    def feed(self, pcm_bytes: bytes, user_is_speaking: bool = False):
+        """Called from mic_sender with each audio chunk.
+        user_is_speaking=True means mic is recording user (not Gemini output).
+        Yes/no detection only fires when user_is_speaking=True."""
+        if not self._available or self._paused or self._rec is None:
+            return
+        with self._lock:
+            try:
+                if self._rec.AcceptWaveform(pcm_bytes):
+                    text = json.loads(self._rec.Result()).get("text", "").lower().strip()
+                    if text:
+                        if self._is_wake(text):
+                            print(f"\n[VOSK] wake: '{text}'")
+                            self.wake_callback()
+                        elif self.response_callback and user_is_speaking and self._is_yes(text):
+                            print(f"\n[VOSK] YES detected locally: '{text}'")
+                            self.response_callback("yes")
+                        elif self.response_callback and user_is_speaking and self._is_no(text):
+                            print(f"\n[VOSK] NO detected locally: '{text}'")
+                            self.response_callback("no")
+                else:
+                    partial = json.loads(self._rec.PartialResult()).get("partial", "").lower().strip()
+                    if partial:
+                        if self._is_wake(partial):
+                            print(f"\n[VOSK] wake(partial): '{partial}'")
+                            self.wake_callback()
+                            self._rec = self._KaldiRecognizer(self._model, 16000)
+                            self._rec.SetWords(False)
+                        elif self.response_callback and user_is_speaking and self._is_yes(partial):
+                            print(f"\n[VOSK] YES(partial): '{partial}'")
+                            self.response_callback("yes")
+                        elif self.response_callback and user_is_speaking and self._is_no(partial):
+                            print(f"\n[VOSK] NO(partial): '{partial}'")
+                            self.response_callback("no")
+            except Exception:
+                pass
+
+    @staticmethod
+    @staticmethod
+    def _is_yes(text):
+        words = text.strip().split()
+        # ONLY unambiguous first-word YES - never phrases Gemini might say
+        return bool(words) and words[0] in (
+            "yes","yeah","yep","yup","ja","ya","ye","yea","sure","ok","okay"
+        )
+
+    @staticmethod
+    def _is_no(text):
+        words = text.strip().split()
+        # First word is no
+        if words and words[0] in ("no","nope","nah","nein","na","not","nah","never"):
+            return True
+        # Common phrases
+        no_phrases = ["don't have","do not have","no book","just curious",
+                      "no textbook","without","i don't","haven't got",
+                      "no i","not really","no thank","no pdf","no file",
+                      "i have no","don't own","no course","curious mode",
+                      "free mode","explore","just want to"]
+        return any(p in text for p in no_phrases)
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def stop(self):
+        self._available = False
+
+    @staticmethod
+    def _is_wake(text: str) -> bool:
+        return any(w in text for w in WAKE_WORDS)
+
+
+# ═══════════════════════════════════════════
+# TFT Display (optional)
+# ═══════════════════════════════════════════
+
+class TFTDisplay:
+    def __init__(self):
+        self.display = None
+        self.img = None
+        self.draw = None
+        self.font_big = None
+        self.font_sm = None
+        self.spi = None
+        self.cs_pin = None
+        self.dc_pin = None
+        self.backlight = None
+        self._available = False
+        self._try_init()
+
+    def _try_init(self):
+        try:
+            import board, digitalio
+            from PIL import Image, ImageDraw, ImageFont
+            from adafruit_rgb_display import st7789
+            self.cs_pin = digitalio.DigitalInOut(board.D5)
+            self.dc_pin = digitalio.DigitalInOut(board.D25)
+            self.backlight = digitalio.DigitalInOut(board.D22)
+            self.backlight.switch_to_output()
+            self.backlight.value = True
+            self.spi = board.SPI()
+            self.display = st7789.ST7789(
+                self.spi, cs=self.cs_pin, dc=self.dc_pin, rst=None,
+                baudrate=24000000, width=135, height=240, x_offset=53, y_offset=40,
+            )
+            try:
+                self.font_big = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+                self.font_sm = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+            except Exception:
+                self.font_big = ImageFont.load_default()
+                self.font_sm = self.font_big
+            from PIL import Image, ImageDraw
+            self.img = Image.new("RGB", (240, 135), (0, 0, 0))
+            self.draw = ImageDraw.Draw(self.img)
+            self._available = True
+            print("[TFT] Display initialized.")
+        except Exception as e:
+            print(f"[TFT] Not available: {e}")
+
+    def _push(self):
+        if self.display and self.img:
+            try:
+                self.display.image(self.img, 90)
+            except Exception:
+                pass
+
+    def show_idle(self):
+        if not self._available: return
+        from PIL import Image, ImageDraw
+        self.img = Image.new("RGB", (240, 135), (10, 10, 10))
+        self.draw = ImageDraw.Draw(self.img)
+        self.draw.text((10, 45), "SocratiDesk", font=self.font_big, fill=(80, 200, 140))
+        self.draw.text((10, 68), "Say 'Hey Socrati'", font=self.font_sm, fill=(140, 140, 140))
+        self._push()
+
+    def show_status(self, line1: str, line2: str = "", color=(100, 220, 160)):
+        if not self._available: return
+        from PIL import Image, ImageDraw
+        self.img = Image.new("RGB", (240, 135), (10, 10, 10))
+        self.draw = ImageDraw.Draw(self.img)
+        self.draw.text((10, 8),  "SocratiDesk", font=self.font_big, fill=(80, 200, 140))
+        self.draw.line([(10, 28), (230, 28)], fill=(50, 50, 50), width=1)
+        self.draw.text((10, 38), line1, font=self.font_sm, fill=color)
+        if line2:
+            self.draw.text((10, 58), line2, font=self.font_sm, fill=(180, 180, 180))
+        self._push()
+
+    def show_qr(self, url: str):
+        if not self._available:
+            print(f"[TFT] QR URL: {url}")
+            return
+        try:
+            import qrcode
+            from PIL import Image, ImageDraw
+            qr = qrcode.QRCode(version=1,
+                               error_correction=qrcode.constants.ERROR_CORRECT_M,
+                               box_size=3, border=2)
+            qr.add_data(url)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            qr_img = qr_img.resize((131, 131), Image.NEAREST)
+            self.img = Image.new("RGB", (240, 135), (0, 0, 0))
+            self.draw = ImageDraw.Draw(self.img)
+            self.img.paste(qr_img, (2, 2))
+            tx = 137
+            self.draw.text((tx, 8),  "Scan to",   font=self.font_sm, fill=(100, 220, 160))
+            self.draw.text((tx, 24), "upload",     font=self.font_sm, fill=(100, 220, 160))
+            self.draw.text((tx, 40), "textbook",   font=self.font_sm, fill=(100, 220, 160))
+            self.draw.text((tx, 70), "Waiting...", font=self.font_sm, fill=(180, 180, 100))
+            self._push()
+        except Exception as e:
+            print(f"[TFT] QR error: {e}")
+
+    def show_textbook_received(self, name: str):
+        short = name[:18] + "..." if len(name) > 18 else name
+        self.show_status("Book received!", short, color=(100, 220, 160))
+
+    def clear(self):
+        if not self._available: return
+        try:
+            from PIL import Image
+            self.display.image(Image.new("RGB", (240, 135), (0, 0, 0)), 90)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        self.clear()
+        try:
+            if self.backlight: self.backlight.value = False
+        except Exception:
+            pass
+        for obj in [self.cs_pin, self.dc_pin, self.backlight]:
+            try:
+                if obj: obj.deinit()
+            except Exception:
+                pass
+        try:
+            if self.spi: self.spi.deinit()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════
+# State
+# ═══════════════════════════════════════════
 
 class AssistantState:
     def __init__(self):
-        self.mode: str | None = None  # None, "curiosity", "textbook"
-        self.topic: str = ""
-        self.recording: bool = False
-        self.running: bool = True
-        self.turn_in_progress: bool = False
-        self.receiving_audio: bool = False
-        self.turn_count: int = 0
+        self.phase = PHASE_IDLE
+        self.topic = ""
+        self.stage = 1
+        self.recording = False
+        self.running = True
+        self.turn_in_progress = False
+        self.receiving_audio = False
+        self.turn_count = 0
+        self.partial_tutor_text = ""
+        self.last_printed_tutor_text = ""
+        self.last_user_transcript = ""
+        self.available_textbooks = []
+        self.curiosity_intro_done = False
 
-        self.partial_tutor_text: str = ""
-        self.last_printed_tutor_text: str = ""
-        self.available_textbooks: list[dict] = []
-
-    def current_turn_label(self) -> str:
-        mode_tag = f" ({self.mode})" if self.mode else ""
-        return f"Turn {self.turn_count}{mode_tag}"
+    def phase_label(self):
+        labels = {
+            PHASE_IDLE:            "Idle - say 'Hey Socrati'",
+            PHASE_GREETING:        "Greeting",
+            PHASE_AWAITING_MODE:   "Waiting for yes/no",
+            PHASE_AWAITING_UPLOAD: "Waiting for PDF upload",
+            PHASE_TEXTBOOK_READY:  "Textbook ready - ask a topic",
+            PHASE_TEXTBOOK:        f"Textbook study (stage {self.stage}/3)",
+            PHASE_CURIOSITY:       f"Curiosity mode (stage {self.stage}/3)",
+        }
+        return labels.get(self.phase, self.phase)
 
 
 state = AssistantState()
+tft = TFTDisplay()
+_ws_ref = None
+_loop_ref = None
+_mic_ref = None
+_speaker_ref = None
 
+
+# ═══════════════════════════════════════════
+# Wake word callback
+# ═══════════════════════════════════════════
+
+def on_wake_word():
+    if state.phase != PHASE_IDLE:
+        return
+    if state.turn_in_progress or state.recording:
+        return
+    if _ws_ref is None or _loop_ref is None:
+        return
+    asyncio.run_coroutine_threadsafe(_trigger_wake(), _loop_ref)
+
+
+def on_vosk_response(answer: str):
+    """Called from Vosk when yes/no detected locally during awaiting_mode."""
+    if state.phase != PHASE_AWAITING_MODE:
+        return
+    if _ws_ref is None or _loop_ref is None:
+        return
+    print(f"\n  [VOSK-LOCAL] {answer.upper()} detected → stopping mic and notifying server")
+    asyncio.run_coroutine_threadsafe(
+        _stop_and_answer(_ws_ref, answer),
+        _loop_ref
+    )
+
+
+async def _stop_and_answer(ws, answer: str):
+    """Stop recording first, then send answer to server."""
+    if state.recording:
+        state.recording = False
+        await send_json(ws, {"type": "end_turn"})
+        print(f"  [MIC] Stopped for yes/no answer")
+    await asyncio.sleep(0.2)
+    await send_json(ws, {"type": "vosk_answer", "answer": answer})
+
+
+async def _trigger_wake():
+    if state.phase != PHASE_IDLE or _ws_ref is None:
+        return
+    print("\n  Wake word detected - starting greeting...")
+    state.phase = PHASE_GREETING
+    tft.show_status("Hello!", "Listening...")
+    await send_json(_ws_ref, {"type": "set_phase", "phase": PHASE_GREETING})
+    await _do_start_recording(_ws_ref)
+
+
+async def _wait_then_listen(ws):
+    """Wait for speaker to finish playing, then start next recording turn."""
+    # Poll speaker queue until empty (audio finished playing)
+    if _speaker_ref is not None:
+        waited = 0
+        while waited < 8.0:  # max 8s wait
+            qsize = _speaker_ref.byte_queue.qsize()
+            pending = len(_speaker_ref.pending)
+            if qsize == 0 and pending == 0:
+                break
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        # Extra buffer for speaker hardware to finish
+        await asyncio.sleep(0.5)
+
+    print(f"  [AUTO-LISTEN] Audio done, starting next turn for phase={state.phase}")
+    await _do_start_recording(ws)
+
+
+async def _do_start_recording(ws):
+    if _mic_ref is None or state.recording or state.turn_in_progress:
+        return
+    _speaker_ref.clear()
+    _mic_ref.clear_queue()
+    state.turn_count += 1
+    state.partial_tutor_text = ""
+    state.turn_in_progress = True
+    await send_json(ws, {"type": "start_turn"})
+
+    # These phases: Gemini speaks first via text trigger — Pi just waits.
+    # awaiting_mode is NOT here — user speaks first in that phase.
+    # GREETING and AWAITING_UPLOAD: Gemini speaks first via text trigger
+    # All other phases: user speaks first
+    # Gemini speaks first in these phases/conditions
+    # Gemini speaks first only for: greeting, awaiting_upload, curiosity intro (once)
+    is_curiosity_intro = (state.phase == PHASE_CURIOSITY and 
+                           not state.topic and 
+                           not state.curiosity_intro_done)
+    if is_curiosity_intro:
+        state.curiosity_intro_done = True  # mark intro as done
+    GEMINI_SPEAKS_FIRST = (PHASE_GREETING, PHASE_AWAITING_UPLOAD)
+    if state.phase in GEMINI_SPEAKS_FIRST or is_curiosity_intro:
+        print(f"\n  [TURN {state.turn_count}] {state.phase_label()} — waiting for Gemini...")
+        return
+
+    # User-voice phases: start recording
+    state.recording = True
+    print(f"\n{'='*52}")
+    print(f"  Turn {state.turn_count} | {state.phase_label()}")
+    if state.topic:
+        print(f"  Topic: {state.topic}")
+    print(f"  Speak now — auto-stops on silence")
+    print(f"{'='*52}")
+
+# ═══════════════════════════════════════════
+# Keyboard
+# ═══════════════════════════════════════════
 
 class KeyboardController:
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop):
         self.loop = loop
-        self.command_queue: asyncio.Queue[str] = asyncio.Queue()
+        self.command_queue = asyncio.Queue()
 
     def start(self):
-        thread = threading.Thread(target=self._input_loop, daemon=True)
-        thread.start()
+        threading.Thread(target=self._input_loop, daemon=True).start()
 
     def _input_loop(self):
         while True:
@@ -63,189 +447,216 @@ class KeyboardController:
                 text = "quit"
             asyncio.run_coroutine_threadsafe(self.command_queue.put(text), self.loop)
 
-    async def get_command(self) -> str:
+    async def get_command(self):
         return await self.command_queue.get()
 
 
-async def send_json(ws, payload: dict):
+async def send_json(ws, payload):
     await ws.send(json.dumps(payload))
 
 
-async def upload_textbook(filepath: str) -> dict | None:
-    """Upload a textbook to the server via HTTP."""
-    try:
-        import aiohttp
-    except ImportError:
-        print("[ERROR] aiohttp not installed. Install with: pip install aiohttp")
-        return None
+# ═══════════════════════════════════════════
+# Receiver
+# ═══════════════════════════════════════════
 
-    path = Path(filepath)
-    if not path.exists():
-        print(f"[ERROR] File not found: {filepath}")
-        return None
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            data = aiohttp.FormData()
-            data.add_field("file", open(path, "rb"), filename=path.name)
-            async with session.post(f"{HTTP_URL}/upload-textbook", data=data) as resp:
-                result = await resp.json()
-                if resp.status == 200:
-                    print(f"[UPLOAD] Textbook uploaded: {result.get('name')} ({result.get('chunks')} chunks)")
-                    return result
-                else:
-                    print(f"[ERROR] Upload failed: {result.get('error', 'unknown')}")
-                    return None
-    except Exception as e:
-        print(f"[ERROR] Upload error: {e}")
-        return None
-
-
-async def mic_sender(ws, mic: MicStreamer):
-    while state.running:
-        chunk = await mic.get_chunk()
-        if not state.recording:
-            continue
-        await send_json(ws, {
-            "type": "audio",
-            "mime_type": "audio/pcm;rate=16000",
-            "data": base64.b64encode(chunk).decode("ascii"),
-        })
-
-
-async def receiver(ws, speaker: SpeakerPlayer):
+async def receiver(ws, speaker, vosk):
     while state.running:
         msg = await ws.recv()
-
         if isinstance(msg, bytes):
             speaker.add_pcm16(msg)
             continue
 
         data = json.loads(msg)
-        msg_type = data.get("type")
+        t = data.get("type")
 
-        if msg_type == "state":
-            value = data.get("value", "")
-            if value:
-                print(f"  [STATE] {value}")
-            if value == "ready":
+        if t == "state":
+            v = data.get("value", "")
+            if v == "ready":
                 state.turn_in_progress = False
                 state.receiving_audio = False
+                if state.phase == PHASE_IDLE:
+                    vosk.resume()
 
-        elif msg_type == "mode":
-            mode = data.get("value")
-            if mode != state.mode:
-                state.mode = mode
-                if mode:
-                    print(f"  [MODE] Switched to: {mode}")
+        elif t == "phase":
+            new = data.get("value", "")
+            if new and new != state.phase:
+                state.phase = new
+                print(f"\n  [PHASE] -> {state.phase_label()}")
+                _handle_phase_ui(new)
+                if new in (PHASE_IDLE, PHASE_AWAITING_MODE):
+                    vosk.resume()
                 else:
-                    print(f"  [MODE] Mode reset")
+                    vosk.pause()  # Gemini handles all speech in dialogue phases
 
-        elif msg_type == "textbooks":
+        elif t == "textbooks":
             state.available_textbooks = data.get("value", [])
             if state.available_textbooks:
-                print(f"  [TEXTBOOKS] Available: {', '.join(b['name'] for b in state.available_textbooks)}")
+                print(f"  [TEXTBOOKS] {', '.join(b['name'] for b in state.available_textbooks)}")
 
-        elif msg_type == "topic":
+        elif t == "topic":
             topic = (data.get("value") or "").strip()
             if topic and topic != state.topic:
                 state.topic = topic
-                print(f"  [TOPIC] {state.topic}")
+                print(f"  [TOPIC] {topic}")
 
-        elif msg_type == "text":
-            text = (data.get("value") or "").strip()
-            if text:
-                state.partial_tutor_text = text
+        elif t == "show_qr":
+            if data.get("value"):
+                _show_qr_ui()
+            else:
+                tft.show_status("Ready to study!", state.topic or "")
 
-        elif msg_type == "audio":
-            pcm_b64 = data.get("data", "")
-            pcm_bytes = base64.b64decode(pcm_b64)
+        elif t == "textbook_received":
+            name = data.get("name", "")
+            print(f"\n  [UPLOAD] Received: {name}")
+            tft.show_textbook_received(name)
+            # Brief pause then start recording so user can say their topic
+            if _ws_ref is not None:
+                asyncio.ensure_future(_wait_then_listen(_ws_ref))
+
+        elif t == "audio":
+            pcm = base64.b64decode(data.get("data", ""))
             if not state.receiving_audio:
-                print(f"  [TUTOR] speaking...")
+                print(f"\n  [speaking...]", end="", flush=True)
                 state.receiving_audio = True
-            speaker.add_pcm16(pcm_bytes)
+            speaker.add_pcm16(pcm)
 
-        elif msg_type == "turn_meta":
-            turn = data.get("turn")
-            stage_used = data.get("stage_used")
-            next_stage = data.get("next_stage")
-            topic = data.get("topic", "")
-            mode = data.get("mode", "")
-            print(f"  [META] Turn {turn} | mode={mode} | topic={topic} | stage={stage_used} -> {next_stage}")
+        elif t == "user_transcript":
+            text = re.sub(r"<[^>]+>", "", (data.get("value") or "")).strip()
+            if text:
+                print(f"\r  YOU:   {text:<60}", end="", flush=True)
+                state.last_user_transcript = text
 
-        elif msg_type == "turn_complete":
+        elif t == "tutor_transcript":
+            text = (data.get("value") or "").strip()
+            if text and text != state.partial_tutor_text:
+                state.partial_tutor_text = text
+                print(f"\r  TUTOR: {text:<60}", end="", flush=True)
+
+        elif t == "turn_meta":
+            stage = data.get("stage")
+            if stage:
+                state.stage = stage
+            pages = data.get("textbook_pages", [])
+            if pages:
+                print(f"\n  [PAGES] {pages}")
+
+        elif t == "turn_complete":
+            print()
             if state.partial_tutor_text:
-                final_text = state.partial_tutor_text.strip()
-                if final_text and final_text != state.last_printed_tutor_text:
-                    print(f"\n  [TUTOR] {final_text}\n")
-                    state.last_printed_tutor_text = final_text
-
+                final = state.partial_tutor_text.strip()
+                if final and final != state.last_printed_tutor_text:
+                    print(f"  +--------------------------------------------------+")
+                    words, line = final.split(), ""
+                    for word in words:
+                        if len(line) + len(word) + 1 > 48:
+                            print(f"  | {line:<48} |")
+                            line = word
+                        else:
+                            line = (line + " " + word).strip()
+                    if line:
+                        print(f"  | {line:<48} |")
+                    print(f"  +--------------------------------------------------+\n")
+                    state.last_printed_tutor_text = final
             state.turn_in_progress = False
             state.receiving_audio = False
             state.partial_tutor_text = ""
 
-        elif msg_type == "error":
-            print(f"  [ERROR] {data.get('message', 'Unknown error')}")
+            # Auto-start next recording AFTER audio finishes playing
+            # AWAITING_UPLOAD excluded — user is uploading via phone
+            AUTO_LISTEN_PHASES = [
+                PHASE_GREETING, PHASE_AWAITING_MODE,
+                PHASE_TEXTBOOK_READY, PHASE_TEXTBOOK, PHASE_CURIOSITY,
+            ]
+            if state.phase in AUTO_LISTEN_PHASES and _ws_ref is not None:
+                print(f"  [AUTO-LISTEN] phase={state.phase}")
+                asyncio.ensure_future(_wait_then_listen(_ws_ref))
+            elif state.phase == PHASE_AWAITING_UPLOAD:
+                _show_qr_ui()
+                print("  [QR] Showing QR code — waiting for upload...")
+
+        elif t == "error":
+            print(f"\n  [ERROR] {data.get('message')}")
             state.turn_in_progress = False
             state.receiving_audio = False
-            state.partial_tutor_text = ""
-
-        else:
-            pass  # ignore unknown
 
 
-async def start_recording(ws, mic: MicStreamer, speaker: SpeakerPlayer):
-    if state.recording:
+def _handle_phase_ui(phase):
+    if phase == PHASE_IDLE:
+        tft.show_idle()
+    elif phase == PHASE_GREETING:
+        tft.show_status("Hello!", "Listening...")
+    elif phase == PHASE_AWAITING_MODE:
+        tft.show_status("Have a textbook?", "Say yes or no")
+    elif phase == PHASE_AWAITING_UPLOAD:
+        # Show QR immediately when phase changes
+        _show_qr_ui()
+    elif phase == PHASE_TEXTBOOK_READY:
+        tft.show_status("Textbook loaded!", "What topic?")
+    elif phase == PHASE_TEXTBOOK:
+        tft.show_status("Textbook mode", f"Stage {state.stage}/3")
+    elif phase == PHASE_CURIOSITY:
+        tft.show_status("Curiosity mode", f"Stage {state.stage}/3")
+
+
+def _show_qr_ui():
+    url = f"{HTTP_URL}/upload?session={DEVICE_ID}"
+    print(f"\n  [QR] {url}")
+    try:
+        import qrcode
+        qr = qrcode.QRCode(version=1, box_size=1, border=2)
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+    except Exception:
+        pass
+    tft.show_qr(url)
+
+
+# ═══════════════════════════════════════════
+# Recording
+# ═══════════════════════════════════════════
+
+async def start_recording(ws, mic, speaker):
+    if state.recording or state.turn_in_progress:
         return
-
+    if state.phase == PHASE_IDLE:
+        state.phase = PHASE_GREETING
+        tft.show_status("Hello!", "Listening...")
+        await send_json(ws, {"type": "set_phase", "phase": PHASE_GREETING})
     speaker.clear()
     mic.clear_queue()
-
     state.turn_count += 1
     state.partial_tutor_text = ""
-
     await send_json(ws, {"type": "start_turn"})
-    mic.start()
-
+    # mic is already running (started at boot for Vosk)
     state.recording = True
     state.turn_in_progress = True
-
-    label = state.current_turn_label()
-    print(f"\n{'='*50}")
-    print(f"  {label} started")
-    if state.mode:
-        print(f"  Mode: {state.mode} | Topic: {state.topic or '(detecting...)'}")
-    else:
-        print(f"  Say 'curiosity mode' or 'textbook mode' to choose.")
+    print(f"\n{'='*52}")
+    print(f"  Turn {state.turn_count} | {state.phase_label()}")
+    if state.topic:
+        print(f"  Topic: {state.topic}")
     print(f"  Press Enter to stop recording")
-    print(f"{'='*50}")
+    print(f"{'='*52}")
 
 
-async def stop_recording(ws, mic: MicStreamer):
+async def stop_recording(ws, mic):
     if not state.recording:
         return
-    mic.stop()
+    # Do NOT stop mic — keep running for Vosk wake word detection
     state.recording = False
     await send_json(ws, {"type": "end_turn"})
-    print("  [RECORDING] stopped, processing...")
+    print("  [MIC] Stopped - processing...")
 
 
-async def command_loop(ws, mic: MicStreamer, speaker: SpeakerPlayer, keyboard: KeyboardController):
+# ═══════════════════════════════════════════
+# Command loop
+# ═══════════════════════════════════════════
+
+async def command_loop(ws, mic, speaker, keyboard):
     print()
-    print("╔══════════════════════════════════════════╗")
-    print("║         SocratiDesk Study Companion      ║")
-    print("╠══════════════════════════════════════════╣")
-    print("║  Enter     = start/stop recording        ║")
-    print("║  reset     = reset topic (keep mode)     ║")
-    print("║  new       = full session reset           ║")
-    print("║  mode X    = set mode (curiosity/textbook)║")
-    print("║  upload F  = upload textbook file         ║")
-    print("║  books     = list uploaded textbooks      ║")
-    print("║  quit      = exit                         ║")
-    print("╚══════════════════════════════════════════╝")
-    print()
-    print("Press Enter to start speaking.")
-    print("The tutor will ask you to choose a learning mode.\n")
+    print("  SocratiDesk - just say 'Hey Socrati' to start!")
+    print("  (Enter = manual trigger, 'new' = reset, 'quit' = exit)\n")
+    tft.show_idle()
 
     while state.running:
         cmd = await keyboard.get_command()
@@ -257,7 +668,7 @@ async def command_loop(ws, mic: MicStreamer, speaker: SpeakerPlayer, keyboard: K
                 await stop_recording(ws, mic)
             break
 
-        if lower == "reset":
+        elif lower == "reset":
             if state.recording:
                 await stop_recording(ws, mic)
             await send_json(ws, {"type": "reset_topic"})
@@ -265,100 +676,171 @@ async def command_loop(ws, mic: MicStreamer, speaker: SpeakerPlayer, keyboard: K
             state.partial_tutor_text = ""
             state.last_printed_tutor_text = ""
             state.turn_count = 0
-            print("  [SESSION] Topic reset. Mode kept.\n")
-            continue
+            print("  [RESET] Topic reset.\n")
 
-        if lower == "new":
+        elif lower == "new":
             if state.recording:
                 await stop_recording(ws, mic)
             await send_json(ws, {"type": "reset_session"})
-            state.mode = None
+            state.phase = PHASE_IDLE
             state.topic = ""
+            state.stage = 1
             state.partial_tutor_text = ""
             state.last_printed_tutor_text = ""
             state.turn_count = 0
-            print("  [SESSION] Full reset. Press Enter to start.\n")
-            continue
+            tft.show_idle()
+            print("  [RESET] Full reset. Say 'Hey Socrati' to start.\n")
 
-        if lower.startswith("mode "):
-            mode = lower.replace("mode ", "").strip()
-            if mode in ("curiosity", "textbook"):
-                await send_json(ws, {"type": "set_mode", "mode": mode})
-                print(f"  [MODE] Set to: {mode}\n")
-            else:
-                print("  [INFO] Use: mode curiosity  or  mode textbook\n")
-            continue
-
-        if lower.startswith("upload "):
-            filepath = cmd[7:].strip()
-            await upload_textbook(filepath)
-            continue
-
-        if lower == "books":
+        elif lower == "books":
             if state.available_textbooks:
-                print("  [TEXTBOOKS]")
                 for b in state.available_textbooks:
-                    print(f"    - {b['name']} ({b['chunks']} chunks)")
+                    print(f"    - {b['name']} ({b.get('pages','?')} pages)")
             else:
-                print("  [TEXTBOOKS] No textbooks uploaded.")
+                print("  No textbooks uploaded.")
             print()
-            continue
 
-        if lower == "":
+        elif lower == "":
             if not state.recording:
                 await start_recording(ws, mic, speaker)
             else:
                 await stop_recording(ws, mic)
+
+        else:
+            print(f"  Unknown: '{cmd}'\n")
+
+
+# ═══════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════
+
+async def mic_sender(ws, mic, vosk):
+    """Send mic audio to server + feed Vosk wake word detector.
+    Single audio stream shared between Gemini and Vosk.
+    Auto-stops on silence when recording.
+    """
+    import numpy as np
+    SILENCE_THRESHOLD = 400    # lowered - 800 was cutting off quiet speech
+    SILENCE_TIMEOUT   = 8.0    # seconds of silence before auto-stop
+    MIN_RECORD_TIME   = 2.0    # min recording time before silence kicks in
+
+    last_sound_time = None
+    record_start_time = None
+
+    while state.running:
+        chunk = await mic.get_chunk()
+        now = asyncio.get_event_loop().time()
+
+        # Compute RMS first (used for silence detection and debug)
+        try:
+            arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+            rms = int(np.sqrt(np.mean(arr ** 2)))
+        except Exception:
+            rms = 0
+
+        # Feed Vosk:
+        # - When idle: wake word detection only
+        # - When recording in awaiting_mode AND at least 1.5s in: yes/no detection
+        #   (prevents Gemini echo from triggering yes/no at start of recording)
+        is_awaiting_mode_recording = (state.recording and 
+                                       state.phase == PHASE_AWAITING_MODE and
+                                       record_start_time is not None and
+                                       (now - record_start_time) > 1.5)
+        if not state.turn_in_progress:
+            vosk.feed(chunk, user_is_speaking=False)
+        elif is_awaiting_mode_recording:
+            vosk.feed(chunk, user_is_speaking=True)
+
+        if not state.recording:
+            last_sound_time = None
+            record_start_time = None
             continue
 
-        print("  [INFO] Unknown command. Use Enter / reset / new / mode X / upload F / books / quit\n")
+        # ── Active recording: send to Gemini ──
+        if record_start_time is None:
+            record_start_time = now
+            print(f"  [AUDIO] Recording started, RMS threshold={SILENCE_THRESHOLD}")
+
+        await send_json(ws, {
+            "type": "audio",
+            "mime_type": "audio/pcm;rate=16000",
+            "data": base64.b64encode(chunk).decode("ascii"),
+        })
+
+        # Print RMS so we can tune threshold
+        if int(now * 4) % 8 == 0:
+            bar = "█" * min(20, rms // 100)
+            print(f"\r  [RMS={rms:4d}] {bar:<20}", end="", flush=True)
+
+        if rms > SILENCE_THRESHOLD:
+            last_sound_time = now
+        elif last_sound_time is None:
+            last_sound_time = now
+
+        elapsed = now - record_start_time
+        silence_dur = now - (last_sound_time or now)
+
+        # awaiting_mode: no auto-stop - wait for Vosk yes/no or manual Enter
+        # All other phases: auto-stop on silence
+        if state.phase != PHASE_AWAITING_MODE:
+            if elapsed > MIN_RECORD_TIME and silence_dur >= SILENCE_TIMEOUT:
+                print(f"\n  [AUTO-STOP] {silence_dur:.1f}s silence - stopping")
+                await stop_recording(ws, mic)
+                last_sound_time = None
+                record_start_time = None
 
 
 async def run_client():
-    loop = asyncio.get_running_loop()
-    keyboard = KeyboardController(loop)
+    global _ws_ref, _loop_ref, _mic_ref, _speaker_ref
+    _loop_ref = asyncio.get_running_loop()
+
+    keyboard = KeyboardController(_loop_ref)
     keyboard.start()
 
-    mic = MicStreamer(loop)
+    mic = MicStreamer(_loop_ref)
     speaker = SpeakerPlayer()
     speaker.start()
+    _mic_ref = mic
+    _speaker_ref = speaker
 
-    print(f"  [CONNECTING] {WS_URL}")
+    # Start mic immediately so Vosk always gets audio (even before recording)
+    mic.start()
+
+    vosk = VoskWakeWord(VOSK_MODEL_PATH, on_wake_word, response_callback=on_vosk_response)
+    vosk.start()
+
+    sep = "&" if "?" in WS_URL else "?"
+    ws_url = f"{WS_URL}{sep}device_id={DEVICE_ID}"
+    print(f"  [CONNECTING] {ws_url}")
 
     async with websockets.connect(
-        WS_URL,
-        max_size=10 * 1024 * 1024,
-        ping_interval=20,
-        ping_timeout=20,
+        ws_url, max_size=10*1024*1024,
+        ping_interval=20, ping_timeout=20,
     ) as ws:
-        await send_json(ws, {
-            "type": "hello",
-            "device": "socratiDesk-pi"
-        })
+        _ws_ref = ws
+        await send_json(ws, {"type": "hello", "device": DEVICE_ID})
+        print("  [CONNECTED]\n")
 
-        print("  [CONNECTED] WebSocket connected\n")
-
-        receiver_task = asyncio.create_task(receiver(ws, speaker))
-        sender_task = asyncio.create_task(mic_sender(ws, mic))
+        r_task = asyncio.create_task(receiver(ws, speaker, vosk))
+        s_task = asyncio.create_task(mic_sender(ws, mic, vosk))
 
         try:
             await command_loop(ws, mic, speaker, keyboard)
         finally:
             state.running = False
+            _ws_ref = None
             if state.recording:
-                await stop_recording(ws, mic)
+                state.recording = False
             mic.stop()
             speaker.stop()
-            receiver_task.cancel()
-            sender_task.cancel()
-            try:
-                await receiver_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await sender_task
-            except asyncio.CancelledError:
-                pass
+            vosk.stop()
+            tft.cleanup()
+            r_task.cancel()
+            s_task.cancel()
+            for t in [r_task, s_task]:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
 
 def main():
