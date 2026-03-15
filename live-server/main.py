@@ -1,51 +1,24 @@
 """
-SocratiDesk Live Server — Gemini Live Agent Challenge (Live Agents track)
-
-Key features for competition:
-- Gemini Live API with real-time audio streaming
-- Two learning modes: Curiosity-Driven + Textbook-Guided
-- Textbook-Guided 3-stage: page reference → comprehension check → feedback
-- Barge-in support (automatic_activity_detection enabled)
-- PDF upload to Google Cloud Storage → text extraction → RAG chunks in Firestore
-- Vision-ready: accepts image frames for "see homework" feature
-- Google GenAI SDK usage
-- Hosted on Google Cloud Run
+SocratiDesk Live Server — clean rewrite for local debugging
+Run locally: GEMINI_API_KEY=xxx uvicorn main:app --host 0.0.0.0 --port 8080 --reload
 """
 
-import asyncio
-import base64
-import hashlib
-import json
-import os
-import re
-import time
+import asyncio, base64, json, os, re, time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 
-# ── PDF extraction ──
 try:
     import pdfplumber
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
 
-# ── Firestore (optional, falls back to in-memory) ──
-try:
-    from google.cloud import firestore
-    db = firestore.AsyncClient()
-    FIRESTORE_ENABLED = True
-except Exception:
-    db = None
-    FIRESTORE_ENABLED = False
-
-# ── Google Cloud Storage (optional, falls back to local) ──
 try:
     from google.cloud import storage as gcs
     gcs_client = gcs.Client()
@@ -56,894 +29,721 @@ except Exception:
     GCS_ENABLED = False
 
 app = FastAPI()
-
-# CORS for mobile upload page
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Serve static files (upload.html, qr.html)
-STATIC_DIR = Path(__file__).parent / "static"
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL_NAME = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
-VOICE_NAME = os.getenv("VOICE_NAME", "Kore")
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/tmp/textbooks"))
+MODEL_NAME     = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+VOICE_NAME     = os.getenv("VOICE_NAME", "Kore")
+UPLOAD_DIR     = Path(os.getenv("UPLOAD_DIR", "/tmp/textbooks"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# ── Phase constants ──
+PHASE_IDLE            = "idle"
+PHASE_GREETING        = "greeting"
+PHASE_AWAITING_MODE   = "awaiting_mode"
+PHASE_AWAITING_UPLOAD = "awaiting_upload"
+PHASE_TEXTBOOK_READY  = "textbook_ready"
+PHASE_TEXTBOOK        = "textbook"
+PHASE_CURIOSITY       = "curiosity"
 
-# ═══════════════════════════════════════════
-# RAG: Textbook Processing & Storage
-# ═══════════════════════════════════════════
+YES_PATTERNS = ["yes","yeah","yep","yup","sure","i have","i do","got one",
+                "have one","have a book","have a textbook","textbook mode",
+                # accent/misrecognition variants
+                "ja","ya","yа","ye","yes i","affirmative","correct","right",
+                "i do have","i've got","got a book","have the book"]
+NO_PATTERNS  = ["no","nope","nah","not really","don't have","do not have",
+                "no book","no textbook","just curious","curious","without",
+                # accent/misrecognition variants
+                "nah","nope","na","nein","non","don't","dont","not have",
+                "i don't","haven't","no i","no thank"]
+
+def is_yes(t):
+    t = t.lower().strip()
+    # single word exact match first
+    if t in ("yes","yeah","yep","yup","ja","ya","ye","sure"):
+        return True
+    return any(p in t for p in YES_PATTERNS)
+
+def is_no(t):
+    t = t.lower().strip()
+    if t in ("no","nope","nah","na","nein","non"):
+        return True
+    return any(p in t for p in NO_PATTERNS)
+def clean_transcript(t): return re.sub(r"<[^>]+>","",t or "").strip().lower()
+
+
+# ═══════════════════════════════════
+# Textbook RAG
+# ═══════════════════════════════════
 
 class TextbookStore:
-    """In-memory textbook store with page-aware chunking.
-    Each chunk knows which page it came from, enabling "go to page X" guidance.
-    """
-
     def __init__(self):
         self.books: dict[str, dict] = {}
 
-    def add_book(self, book_id: str, name: str, pages: list[dict]):
-        """pages: list of {"page": int, "text": str}"""
+    def add_book(self, book_id, name, pages):
         chunks = []
-        for page_info in pages:
-            page_num = page_info["page"]
-            text = page_info["text"]
-            page_chunks = self._chunk_text(text, chunk_size=500, overlap=60)
-            for chunk in page_chunks:
-                chunks.append({
-                    "page": page_num,
-                    "text": chunk,
-                })
+        for p in pages:
+            for c in self._chunk(p["text"]):
+                chunks.append({"page": p["page"], "text": c})
         self.books[book_id] = {"name": name, "chunks": chunks, "total_pages": len(pages)}
         return len(chunks)
 
-    def remove_book(self, book_id: str):
+    def remove_book(self, book_id):
         self.books.pop(book_id, None)
 
-    def list_books(self) -> list[dict]:
-        return [
-            {"id": bid, "name": b["name"], "chunks": len(b["chunks"]), "pages": b["total_pages"]}
-            for bid, b in self.books.items()
-        ]
+    def list_books(self):
+        return [{"id": k, "name": v["name"], "chunks": len(v["chunks"]),
+                 "pages": v["total_pages"]} for k, v in self.books.items()]
 
-    def search(self, query: str, top_k: int = 3) -> list[dict]:
-        """Keyword search returning page-aware chunks."""
-        query_words = set(re.findall(r"\w+", query.lower()))
-        if not query_words:
-            return []
-
+    def search(self, query, top_k=3):
+        words = set(re.findall(r"\w+", query.lower()))
+        if not words: return []
         scored = []
-        for book_id, book in self.books.items():
-            for i, chunk in enumerate(book["chunks"]):
-                chunk_words = set(re.findall(r"\w+", chunk["text"].lower()))
-                overlap = len(query_words & chunk_words)
-                if overlap > 0:
-                    scored.append({
-                        "book_id": book_id,
-                        "book_name": book["name"],
-                        "page": chunk["page"],
-                        "text": chunk["text"],
-                        "score": overlap,
-                    })
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:top_k]
+        for bid, book in self.books.items():
+            for chunk in book["chunks"]:
+                score = len(words & set(re.findall(r"\w+", chunk["text"].lower())))
+                if score: scored.append({**chunk, "book_id": bid,
+                                          "book_name": book["name"], "score": score})
+        return sorted(scored, key=lambda x: -x["score"])[:top_k]
 
     @staticmethod
-    def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 60) -> list[str]:
-        paragraphs = re.split(r"\n{2,}", text.strip())
-        chunks, current = [], ""
-        for para in paragraphs:
+    def _chunk(text, size=500):
+        chunks, cur = [], ""
+        for para in re.split(r"\n{2,}", text.strip()):
             para = para.strip()
-            if not para:
-                continue
-            if len(current) + len(para) + 1 <= chunk_size:
-                current = (current + "\n" + para).strip()
+            if not para: continue
+            if len(cur) + len(para) + 1 <= size:
+                cur = (cur + "\n" + para).strip()
             else:
-                if current:
-                    chunks.append(current)
-                current = para
-        if current:
-            chunks.append(current)
-        return chunks if chunks else [text[:chunk_size]] if text.strip() else []
-
+                if cur: chunks.append(cur)
+                cur = para
+        if cur: chunks.append(cur)
+        return chunks or ([text[:size]] if text.strip() else [])
 
 textbook_store = TextbookStore()
 
 
-def extract_pages_from_pdf(filepath: str) -> list[dict]:
-    """Extract text per page, preserving page numbers."""
-    if not PDF_SUPPORT:
-        raise RuntimeError("pdfplumber not installed")
-    pages = []
-    with pdfplumber.open(filepath) as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            if text.strip():
-                pages.append({"page": i + 1, "text": text})
-    return pages
+# ═══════════════════════════════════
+# System Instructions
+# ═══════════════════════════════════
 
+PERSONA = """You are SocratiDesk, a warm encouraging voice-first AI study companion.
+Rules: speak conversationally, 2-3 short sentences max, no bullet points,
+use contractions, never say "as an AI"."""
 
-async def save_to_firestore(book_id: str, name: str, pages: list[dict]):
-    """Persist textbook metadata to Firestore for cross-session access."""
-    if not FIRESTORE_ENABLED:
-        return
-    try:
-        doc_ref = db.collection("textbooks").document(book_id)
-        await doc_ref.set({
-            "name": name,
-            "total_pages": len(pages),
-            "uploaded_at": firestore.SERVER_TIMESTAMP,
-        })
-        # Store chunks in subcollection
-        chunks = textbook_store.books.get(book_id, {}).get("chunks", [])
-        batch = db.batch()
-        for i, chunk in enumerate(chunks):
-            chunk_ref = doc_ref.collection("chunks").document(f"chunk_{i:04d}")
-            batch.set(chunk_ref, {
-                "page": chunk["page"],
-                "text": chunk["text"],
-                "index": i,
-            })
-        await batch.commit()
-    except Exception as e:
-        print(f"[FIRESTORE] Save failed: {e}")
+def instr_for_phase(phase, stage=1, topic="", history=None, rag=None, book_name=""):
+    history = history or []
+    rag = rag or []
 
+    if phase == PHASE_GREETING:
+        books = textbook_store.list_books()
+        book_hint = f"(Textbook '{books[0]['name']}' already uploaded!)" if books else "(No textbook uploaded yet.)"
+        return f"""{PERSONA}
+{book_hint}
+The student just woke you up with a wake word.
+Greet them warmly in 1 sentence, then ask: "Do you have a textbook you would like to study with today?"
+2 sentences total. Do NOT explain anything else yet."""
 
-def upload_to_gcs(filepath: str, filename: str) -> str:
-    """Upload PDF to GCS and return the GCS URI."""
-    if not GCS_ENABLED:
-        return f"local://{filepath}"
-    try:
-        bucket = gcs_client.bucket(GCS_BUCKET)
-        blob = bucket.blob(f"textbooks/{filename}")
-        blob.upload_from_filename(filepath)
-        return f"gs://{GCS_BUCKET}/textbooks/{filename}"
-    except Exception as e:
-        print(f"[GCS] Upload failed: {e}")
-        return f"local://{filepath}"
+    if phase == PHASE_AWAITING_MODE:
+        return f"""{PERSONA}
+The student is answering yes or no. STAY COMPLETELY SILENT.
+Do not say anything. Do not respond. Just listen.
+You are in listening-only mode."""
 
+    if phase == PHASE_AWAITING_UPLOAD:
+        return f"""{PERSONA}
+The student needs to upload a textbook.
+Tell them to scan the QR code on the screen to upload their PDF.
+Sound encouraging. 2 sentences."""
 
-# ═══════════════════════════════════════════
-# Mode & Topic Detection
-# ═══════════════════════════════════════════
+    if phase == PHASE_TEXTBOOK_READY:
+        return f"""{PERSONA}
+The textbook "{book_name}" was just uploaded.
+The student will now tell you what topic they want to study.
+When they speak:
+1. Confirm you received the book in 1 sentence.
+2. Acknowledge their topic warmly.
+3. Guide them to open the book to the relevant page.
+Keep it to 2-3 sentences. Be encouraging."""
 
-LEARNING_MODES = {
-    "curiosity": ["curiosity", "free", "general", "explore", "free mode",
-                   "curiosity mode", "free learning", "ask anything"],
-    "textbook": ["textbook", "book", "guided", "textbook mode", "guided mode",
-                  "study mode", "study my book", "study with book"],
-}
-
-
-def detect_mode_from_text(text: str) -> Optional[str]:
-    lower = (text or "").lower().strip()
-    for mode, keywords in LEARNING_MODES.items():
-        for kw in keywords:
-            if kw in lower:
-                return mode
-    return None
-
-
-def infer_topic_from_text(text: str) -> str:
-    raw = (text or "").strip()
-    lower = raw.lower()
-    filler_prefixes = ["oh ", "uh ", "um ", "well ", "so ", "i want to know ",
-                       "can you tell me ", "i'd like to learn about "]
-    for filler in filler_prefixes:
-        if lower.startswith(filler):
-            raw = raw[len(filler):].strip()
-            lower = raw.lower()
-            break
-    prefixes = [
-        "what is ", "what are ", "who is ", "who are ", "explain ",
-        "tell me about ", "how does ", "how do ", "why is ", "why are ",
-        "define ", "what does ", "what's ", "describe ",
-    ]
-    for prefix in prefixes:
-        if lower.startswith(prefix):
-            return raw[len(prefix):].strip(" ?.")
-    return raw.strip(" ?.")
-
-
-def build_history_summary(history: list[dict]) -> str:
-    if not history:
-        return "No previous turns yet."
-    lines = []
-    for item in history[-3:]:
-        t = item.get("turn", "?")
-        lines.append(f"Turn {t} student: {item.get('user', '').strip()}")
-        lines.append(f"Turn {t} tutor: {item.get('tutor', '').strip()}")
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════
-# System Instructions (competition-optimized)
-# ═══════════════════════════════════════════
-
-PERSONA_RULES = """
-Your name is SocratiDesk. You are a warm, encouraging voice-first AI study companion.
-You have a distinct personality:
-- Speak like a friendly, patient teacher — never robotic.
-- Use the student's name if known.
-- Celebrate small wins ("Nice thinking!", "You're getting closer!").
-- Keep responses to 2-3 short spoken sentences. No bullet points.
-- Sound natural — use contractions, conversational phrasing.
-- Never say "as an AI" or "I'm a language model".
-"""
-
-
-def build_mode_selection_instruction() -> str:
-    books = textbook_store.list_books()
-    book_info = ""
-    if books:
-        names = ", ".join(b["name"] for b in books)
-        book_info = f"\nTextbooks available: {names}"
-    return f"""{PERSONA_RULES}
-
-The student just started. Greet them and help choose a mode.
-{book_info}
-
-Two modes:
-1. Curiosity Mode — explore any topic freely by asking questions.
-2. Textbook Mode — study with an uploaded textbook. You'll guide them to specific pages.
-{"(A textbook is already uploaded and ready!)" if books else "(No textbook uploaded yet — suggest curiosity mode, or they can upload a book.)"}
-
-Rules:
-- Greet warmly in 1 sentence.
-- Describe both modes in 1 sentence each.
-- Ask which mode. Keep to 3-4 sentences total.
-- Do NOT start teaching yet.
-"""
-
-
-def build_curiosity_instruction(topic: str, stage: int, history: list[dict]) -> str:
-    ctx = build_history_summary(history)
-    base = f"""{PERSONA_RULES}
-
-Mode: Curiosity (free exploration)
-Topic: {topic or "unknown"}
-Current stage: {stage}
-Conversation so far:
+    if phase == PHASE_CURIOSITY:
+        ctx = "\n".join(f"Turn {h['turn']} student: {h['user']}\nTurn {h['turn']} tutor: {h['tutor']}"
+                        for h in (history or [])[-3:]) or "No history yet."
+        if stage == 1:
+            return f"""{PERSONA}
+Mode: Curiosity. Topic: {topic or "unknown"}. Stage 1/3.
 {ctx}
+NEVER give the answer. Ask: "What do you already know about {topic or 'this'}?"
+Acknowledge warmly first. 2 sentences."""
+        if stage == 2:
+            return f"""{PERSONA}
+Mode: Curiosity. Topic: {topic}. Stage 2/3.
+{ctx}
+Give brief feedback, then ask ONE guiding follow-up question. Do NOT give the answer yet. 2 sentences."""
+        return f"""{PERSONA}
+Mode: Curiosity. Topic: {topic}. Stage 3/3.
+{ctx}
+Give feedback, then provide a clear concise explanation. 2-3 sentences."""
 
-Core rule: NEVER give the answer immediately. Guide the student to think.
-"""
-    if stage == 1:
-        return base + """
-Stage 1 — Open question:
-- Acknowledge the question warmly.
-- Ask ONE open question: "What do you already know about [topic]?"
-- Encourage them to guess. Do NOT define the concept.
-"""
-    if stage == 2:
-        return base + """
-Stage 2 — Guided question:
-- Give brief feedback on their answer (correct/partially/not quite).
-- Ask ONE guiding follow-up question that hints toward the key concept.
-- Do NOT give the full definition yet.
-"""
-    return base + """
-Stage 3 — Conclusion:
-- Give brief feedback on their latest answer.
-- Provide a clear, concise definition or explanation (2-3 sentences max).
-- Optionally ask if they want to explore a related topic.
-"""
-
-
-def build_textbook_instruction(
-    topic: str, stage: int, history: list[dict],
-    rag_results: list[dict], book_name: str
-) -> str:
-    ctx = build_history_summary(history)
-
-    # Build page-aware context
-    if rag_results:
-        pages_mentioned = sorted(set(r["page"] for r in rag_results))
-        page_str = ", ".join(str(p) for p in pages_mentioned)
-        rag_text = "\n---\n".join(
-            f"[Page {r['page']}] {r['text']}" for r in rag_results
-        )
-    else:
-        pages_mentioned = []
-        page_str = "unknown"
-        rag_text = "(No matching content found in the textbook for this topic.)"
-
-    base = f"""{PERSONA_RULES}
-
-Mode: Textbook-Guided Study
-Textbook: "{book_name}"
-Topic: {topic or "unknown"}
+    if phase == PHASE_TEXTBOOK:
+        pages = sorted(set(r["page"] for r in rag)) if rag else []
+        page_str = ", ".join(str(p) for p in pages) or "?"
+        rag_text = "\n---\n".join(f"[Page {r['page']}] {r['text']}" for r in rag) or "(no content found)"
+        ctx = "\n".join(f"Turn {h['turn']} student: {h['user']}\nTurn {h['turn']} tutor: {h['tutor']}"
+                        for h in (history or [])[-3:]) or "No history yet."
+        first_page = pages[0] if pages else "?"
+        if stage == 1:
+            return f"""{PERSONA}
+Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 1/3.
 Relevant pages: {page_str}
-Current stage: {stage}
-
-Textbook excerpts:
----
+Content:
 {rag_text}
----
-
-Conversation so far:
 {ctx}
+Tell student to open page {first_page}, describe what they'll find, ask them to read and report back. 3 sentences."""
+        if stage == 2:
+            return f"""{PERSONA}
+Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 2/3.
+Relevant pages: {page_str}
+Content:
+{rag_text}
+{ctx}
+Evaluate their understanding vs textbook. Ask ONE guiding question. 2 sentences."""
+        return f"""{PERSONA}
+Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 3/3.
+Relevant pages: {page_str}
+Content:
+{rag_text}
+{ctx}
+Give clear feedback, summarize key concept citing page {first_page}. 2-3 sentences."""
 
-Core rule: Guide the student TO their textbook first, then check understanding.
-"""
-    if stage == 1:
-        return base + f"""
-Stage 1 — Page reference:
-- Tell the student which page(s) to look at: "Open your book to page {pages_mentioned[0] if pages_mentioned else '?'}."
-- Briefly describe what they'll find there (e.g., "You'll see a diagram of..." or "There's a section about...").
-- Ask them to read that section and then tell you what they understood.
-- Say something like: "Take a moment to read it, then tell me what you think."
-- Do NOT explain the concept yet. Let the textbook do the teaching.
-"""
-    if stage == 2:
-        return base + """
-Stage 2 — Comprehension check:
-- The student has read the textbook section and shared their understanding.
-- Evaluate what they said against the textbook content.
-- Point out what they got right and what's missing.
-- Ask ONE guiding question to deepen understanding.
-- Reference specific textbook details (figures, key terms, examples from the pages).
-- Do NOT give the complete answer yet.
-"""
-    return base + f"""
-Stage 3 — Feedback + summary:
-- Give clear feedback on the student's understanding.
-- Provide a concise summary of the key concept, drawing from the textbook content.
-- Mention specific details from the textbook (page numbers, diagrams, formulas).
-- If they understood well, congratulate them and suggest a related topic or the next section.
-- If they struggled, gently clarify and suggest re-reading page {pages_mentioned[0] if pages_mentioned else '?'}.
-"""
+    # fallback
+    return f"{PERSONA}\nHelp the student."
 
 
-# ═══════════════════════════════════════════
-# WebSocket Session Bridge
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════
+# Live Session Bridge
+# ═══════════════════════════════════
 
 class LiveSessionBridge:
-    def __init__(self, websocket: WebSocket):
-        self.websocket = websocket
+    def __init__(self, ws: WebSocket, device_id: str = "default"):
+        self.ws = ws
+        self.device_id = device_id
 
-        self.live_cm = None
-        self.live_session = None
-        self.receiver_task: Optional[asyncio.Task] = None
-
-        # Session state
-        self.mode: Optional[str] = None
-        self.topic: str = ""
-        self.stage: int = 1
-        self.turn_count: int = 0
-        self.history: list[dict] = []
-
-        # Textbook state
-        self.active_book_id: Optional[str] = None
-        self.active_book_name: str = ""
-        self.last_rag_results: list[dict] = []
-
-        # Transcript tracking
-        self.current_input_transcript: str = ""
-        self.current_output_text: str = ""
-        self.last_topic_sent: str = ""
-        self.last_output_text_sent: str = ""
-
-        # Audio buffer for efficient streaming
-        self.audio_buffer = bytearray()
-        self.last_audio_flush_time = time.monotonic()
-        self.audio_flush_bytes = 12000
-        self.audio_flush_interval = 0.12
-
-    async def _open_turn_session(self, system_instruction: str):
-        config = {
-            "response_modalities": ["AUDIO"],
-            "input_audio_transcription": {},
-            "output_audio_transcription": {},
-            "speech_config": {
-                "voice_config": {
-                    "prebuilt_voice_config": {
-                        "voice_name": VOICE_NAME
-                    }
-                }
-            },
-            # Barge-in: enabled! Student can interrupt the tutor naturally.
-            "realtime_input_config": {
-                "automatic_activity_detection": {
-                    "disabled": False
-                }
-            },
-            "system_instruction": system_instruction,
-        }
-
-        self.live_cm = client.aio.live.connect(
-            model=MODEL_NAME,
-            config=config,
-        )
-        self.live_session = await self.live_cm.__aenter__()
-        self.receiver_task = asyncio.create_task(self._receiver_loop())
-
-    async def _close_turn_session(self):
-        if self.receiver_task:
-            self.receiver_task.cancel()
-            try:
-                await self.receiver_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self.receiver_task = None
-
-        if self.live_cm is not None:
-            try:
-                await self.live_cm.__aexit__(None, None, None)
-            except Exception:
-                pass
-        self.live_cm = None
-        self.live_session = None
-
-    def _get_system_instruction(self) -> str:
-        if self.mode is None:
-            return build_mode_selection_instruction()
-
-        if self.mode == "textbook":
-            self.last_rag_results = []
-            if self.topic and textbook_store.books:
-                self.last_rag_results = textbook_store.search(self.topic, top_k=3)
-            return build_textbook_instruction(
-                topic=self.topic,
-                stage=self.stage,
-                history=self.history,
-                rag_results=self.last_rag_results,
-                book_name=self.active_book_name or "uploaded textbook",
-            )
-
-        return build_curiosity_instruction(
-            topic=self.topic,
-            stage=self.stage,
-            history=self.history,
-        )
-
-    async def begin_turn(self):
-        self.turn_count += 1
-        self.current_input_transcript = ""
-        self.current_output_text = ""
-        self.last_output_text_sent = ""
-        self.audio_buffer = bytearray()
-
-        instruction = self._get_system_instruction()
-        await self._open_turn_session(instruction)
-
-    async def send_audio(self, pcm_bytes: bytes, mime_type: str = "audio/pcm;rate=16000"):
-        if self.live_session is None:
-            return
-        await self.live_session.send_realtime_input(
-            audio=types.Blob(data=pcm_bytes, mime_type=mime_type)
-        )
-
-    async def send_image(self, image_bytes: bytes, mime_type: str = "image/jpeg"):
-        """Send a camera/screen frame for vision-enabled tutoring."""
-        if self.live_session is None:
-            return
-        await self.live_session.send_realtime_input(
-            video=types.Blob(data=image_bytes, mime_type=mime_type)
-        )
-
-    async def end_turn(self):
-        if self.live_session is None:
-            return
-        await self.live_session.send_realtime_input(
-            activity_end=types.ActivityEnd()
-        )
-
-    async def reset_topic(self):
-        await self._close_turn_session()
-        self.topic = ""
-        self.stage = 1
+        # State
+        self.phase    = PHASE_IDLE
+        self.topic    = ""
+        self.stage    = 1
+        self.history  = []
         self.turn_count = 0
-        self.history = []
-        self.last_rag_results = []
-        self.current_input_transcript = ""
-        self.current_output_text = ""
-        self.last_topic_sent = ""
-        self.last_output_text_sent = ""
-        self.audio_buffer = bytearray()
-        await self._send({"type": "state", "value": "ready"})
 
-    async def reset_session(self):
-        await self._close_turn_session()
-        self.mode = None
-        self.topic = ""
-        self.stage = 1
-        self.turn_count = 0
-        self.history = []
-        self.active_book_id = None
+        self.active_book_id   = ""
         self.active_book_name = ""
-        self.last_rag_results = []
-        self.current_input_transcript = ""
-        self.current_output_text = ""
-        self.last_topic_sent = ""
-        self.last_output_text_sent = ""
-        self.audio_buffer = bytearray()
-        await self._send({"type": "state", "value": "ready"})
-        await self._send({"type": "mode", "value": None})
+        self.last_rag         = []
 
-    async def close(self):
-        await self._close_turn_session()
+        self.current_user_text  = ""
+        self.current_tutor_text = ""
+        self.last_tutor_sent    = ""
+        self._yes_no_detected   = False
+        self._should_close      = False
+        self._curiosity_intro_done = False
 
+        # Gemini session
+        self._live_cm      = None
+        self._live_session = None
+        self._recv_task: Optional[asyncio.Task] = None
+
+        # Audio buffer
+        self._audio_buf  = bytearray()
+        self._last_flush = time.monotonic()
+
+    # ── send to Pi ──
     async def _send(self, payload: dict):
         try:
-            await self.websocket.send_text(json.dumps(payload))
+            await self.ws.send_text(json.dumps(payload))
         except Exception:
             pass
 
-    async def _flush_audio_buffer(self, force: bool = False):
+    async def _flush_audio(self, force=False):
         now = time.monotonic()
-        if not self.audio_buffer:
-            return
-        should_flush = (
-            force
-            or len(self.audio_buffer) >= self.audio_flush_bytes
-            or (now - self.last_audio_flush_time) >= self.audio_flush_interval
-        )
-        if should_flush:
-            payload = base64.b64encode(bytes(self.audio_buffer)).decode("ascii")
-            await self._send({"type": "audio", "data": payload})
-            self.audio_buffer = bytearray()
-            self.last_audio_flush_time = now
+        if not self._audio_buf: return
+        if force or len(self._audio_buf) >= 12000 or now - self._last_flush >= 0.12:
+            await self._send({"type": "audio",
+                              "data": base64.b64encode(bytes(self._audio_buf)).decode()})
+            self._audio_buf = bytearray()
+            self._last_flush = now
 
-    async def _receiver_loop(self):
-        async for response in self.live_session.receive():
+    # ── open/close Gemini session ──
+    def _build_config(self, system_instruction: str) -> dict:
+        return {
+            "response_modalities": ["AUDIO"],
+            "input_audio_transcription":  {},
+            "output_audio_transcription": {},
+            "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": VOICE_NAME}}},
+            "realtime_input_config": {"automatic_activity_detection": {"disabled": False}},
+            "system_instruction": system_instruction,
+        }
+
+    async def _open(self, instruction: str):
+        self._live_cm = client.aio.live.connect(model=MODEL_NAME,
+                                                 config=self._build_config(instruction))
+        self._live_session = await self._live_cm.__aenter__()
+        self._recv_task = asyncio.create_task(self._recv_loop())
+        print(f"[SERVER] Gemini session opened | phase={self.phase}")
+
+    async def _close(self):
+        if self._recv_task:
+            self._recv_task.cancel()
+            try: await self._recv_task
+            except: pass
+            self._recv_task = None
+        if self._live_cm:
+            try: await self._live_cm.__aexit__(None, None, None)
+            except: pass
+        self._live_cm = None
+        self._live_session = None
+
+    # ── Gemini receiver loop ──
+    async def _recv_loop(self):
+        async for resp in self._live_session.receive():
             try:
-                content = response.server_content
-                if content is None:
-                    continue
+                sc = resp.server_content
+                if sc is None: continue
 
-                # ── User transcript ──
-                if content.input_transcription:
-                    transcript = (content.input_transcription.text or "").strip()
-                    if transcript:
-                        self.current_input_transcript = transcript
+                if sc.input_transcription:
+                    t = (sc.input_transcription.text or "").strip()
+                    if t:
+                        self.current_user_text = t
+                        clean = clean_transcript(t)
+                        print(f"[SERVER] user_transcript: {t!r}  phase={self.phase}  "
+                              f"is_yes={is_yes(clean)}  is_no={is_no(clean)}")
+                        await self._send({"type": "user_transcript", "value": t})
+                        await self._handle_transcript(clean)
 
-                        # Mode detection
-                        if self.mode is None:
-                            detected = detect_mode_from_text(transcript)
-                            if detected:
-                                self.mode = detected
-                                if detected == "textbook":
-                                    books = textbook_store.list_books()
-                                    if books:
-                                        self.active_book_id = books[0]["id"]
-                                        self.active_book_name = books[0]["name"]
-                                await self._send({"type": "mode", "value": self.mode})
+                if sc.output_transcription:
+                    t = (sc.output_transcription.text or "").strip()
+                    if t and t != self.last_tutor_sent:
+                        self.last_tutor_sent = t
+                        self.current_tutor_text = t
+                        await self._send({"type": "tutor_transcript", "value": t})
+                        # No tutor-output detection for yes/no
+                        # Only Vosk and user transcript handle yes/no routing
 
-                        # Topic detection (only after mode is set)
-                        if self.mode and not self.topic:
-                            inferred = infer_topic_from_text(transcript)
-                            if inferred and len(inferred) >= 3:
-                                self.topic = inferred
-
-                        if self.topic and self.topic != self.last_topic_sent:
-                            self.last_topic_sent = self.topic
-                            await self._send({"type": "topic", "value": self.topic})
-
-                        await self._send({"type": "user_transcript", "value": transcript})
-                        await self._send({"type": "state", "value": "thinking"})
-
-                # ── Tutor transcript ──
-                if content.output_transcription:
-                    text = (content.output_transcription.text or "").strip()
-                    if text and text != self.last_output_text_sent:
-                        self.last_output_text_sent = text
-                        self.current_output_text = text
-                        await self._send({"type": "tutor_transcript", "value": text})
-
-                # ── Streaming audio ──
-                if content.model_turn:
-                    for part in content.model_turn.parts:
+                if sc.model_turn:
+                    for part in sc.model_turn.parts:
                         if getattr(part, "inline_data", None):
-                            self.audio_buffer.extend(part.inline_data.data)
-                            await self._flush_audio_buffer(force=False)
+                            self._audio_buf.extend(part.inline_data.data)
+                            await self._flush_audio()
 
-                # ── Turn complete ──
-                if content.generation_complete is True:
-                    await self._flush_audio_buffer(force=True)
-
+                if sc.generation_complete:
+                    await self._flush_audio(force=True)
                     self.history.append({
                         "turn": self.turn_count,
-                        "user": self.current_input_transcript,
-                        "tutor": self.current_output_text,
-                        "stage_used": self.stage,
-                        "mode": self.mode,
+                        "user": self.current_user_text,
+                        "tutor": self.current_tutor_text,
+                        "phase": self.phase, "stage": self.stage,
                     })
+                    # Only advance stage if user actually spoke a topic
+                    # Don't advance on intro turn (curiosity stage 1 with no topic yet)
+                    is_intro_turn = (self.phase == PHASE_CURIOSITY and 
+                                     not self.topic and self.stage == 1)
+                    if self.phase in (PHASE_TEXTBOOK, PHASE_CURIOSITY) and self.stage < 3:
+                        if not is_intro_turn:
+                            self.stage += 1
 
-                    # Advance stage
-                    if self.mode and self.topic and self.stage < 3:
-                        self.stage += 1
+                    # Phase transitions after turn completes
+                    if self.phase == PHASE_GREETING:
+                        self.phase = PHASE_AWAITING_MODE
+                        print(f"[SERVER] phase → {self.phase}")
 
-                    # Send page reference info for textbook mode
-                    rag_pages = []
-                    if self.last_rag_results:
-                        rag_pages = sorted(set(r["page"] for r in self.last_rag_results))
+                    rag_pages = sorted(set(r["page"] for r in self.last_rag)) if self.last_rag else []
 
-                    await self._send({
-                        "type": "turn_meta",
-                        "turn": self.turn_count,
-                        "mode": self.mode,
-                        "stage_used": self.history[-1]["stage_used"],
-                        "next_stage": self.stage,
-                        "topic": self.topic,
-                        "textbook_pages": rag_pages,
-                    })
+                    # Close session FIRST, then notify Pi (prevents race condition)
+                    await self._close()
+                    print(f"[SERVER] Turn {self.turn_count} complete, session closed")
 
-                    await self._send({"type": "state", "value": "ready"})
+                    await self._send({"type": "phase",     "value": self.phase})
+                    await self._send({"type": "turn_meta", "turn": self.turn_count,
+                                      "phase": self.phase, "stage": self.stage,
+                                      "topic": self.topic, "textbook_pages": rag_pages})
+                    await self._send({"type": "state",        "value": "ready"})
                     await self._send({"type": "turn_complete"})
-                    await self._close_turn_session()
                     return
 
-            except Exception as inner_exc:
-                await self._send({
-                    "type": "error",
-                    "message": f"Receiver error: {str(inner_exc)}"
-                })
+                # Exit cleanly if yes/no was detected mid-turn
+                if self._should_close:
+                    self._should_close = False
+                    return
+
+            except Exception as e:
+                if "1000" in str(e) or "ConnectionClosedOK" in str(e):
+                    return  # normal close
+                if "1000" in str(e) or "ConnectionClosedOK" in str(e):
+                    # Normal close, not an error
+                    return
+                print(f"[SERVER] recv_loop error: {e}")
+                await self._send({"type": "error", "message": str(e)})
                 return
 
+    async def _handle_transcript(self, clean: str):
+        """Phase transitions driven by what user says."""
+        if not clean or len(clean) < 2: return
 
-# ═══════════════════════════════════════════
-# HTTP Endpoints
-# ═══════════════════════════════════════════
+        print(f"[SERVER] _handle_transcript: phase={self.phase!r} clean={clean!r}")
+
+        if self.phase == PHASE_AWAITING_MODE:
+            if is_yes(clean):
+                await self._route_yes()
+                await self._send({"type": "phase", "value": self.phase})
+                await self._send({"type": "state", "value": "ready"})
+                await self._send({"type": "turn_complete"})
+                print(f"[SERVER] transcript yes → turn_complete sent")
+                self._should_close = True  # signal _recv_loop to exit cleanly
+            elif is_no(clean):
+                await self._route_no()
+                await self._send({"type": "phase", "value": self.phase})
+                await self._send({"type": "state", "value": "ready"})
+                await self._send({"type": "turn_complete"})
+                print(f"[SERVER] transcript no → turn_complete sent")
+                self._should_close = True  # signal _recv_loop to exit cleanly
+            else:
+                print(f"[SERVER] ambiguous response: {clean!r} — Gemini will handle")
+            return
+
+        if self.phase == PHASE_TEXTBOOK_READY:
+            topic = self._infer_topic(clean)
+            if topic:
+                self.topic = topic
+                self.stage = 1
+                self.phase = PHASE_TEXTBOOK
+                await self._send({"type": "topic",  "value": self.topic})
+                await self._send({"type": "phase",  "value": self.phase})
+            return
+
+        if self.phase == PHASE_CURIOSITY and not self.topic:
+            topic = self._infer_topic(clean)
+            if topic:
+                self.topic = topic
+                await self._send({"type": "topic", "value": self.topic})
+            return
+
+    @staticmethod
+    def _infer_topic(text: str) -> str:
+        for prefix in ["what is ","what are ","who is ","explain ","tell me about ",
+                       "how does ","how do ","why is ","define "]:
+            if text.startswith(prefix):
+                return text[len(prefix):].strip(" ?.")
+        return text.strip(" ?.") if len(text) >= 3 else ""
+
+    # ── Public API called by WebSocket handler ──
+
+    async def _route_yes(self):
+        if self._yes_no_detected: return
+        self._yes_no_detected = True
+        books = textbook_store.list_books()
+        if books:
+            self.active_book_id   = books[0]["id"]
+            self.active_book_name = books[0]["name"]
+            self.phase = PHASE_TEXTBOOK_READY
+        else:
+            self.phase = PHASE_AWAITING_UPLOAD
+            await self._send({"type": "show_qr", "value": True})
+        await self._send({"type": "phase", "value": self.phase})
+        print(f"[SERVER] routed YES → phase={self.phase}")
+
+    async def _route_no(self):
+        if self._yes_no_detected: return
+        self._yes_no_detected = True
+        self.phase = PHASE_CURIOSITY
+        self.stage = 1
+        await self._send({"type": "phase", "value": self.phase})
+        print(f"[SERVER] routed NO → phase={self.phase}")
+
+    async def begin_turn(self):
+        """Start a new Gemini turn. For GREETING/AWAITING_UPLOAD/TEXTBOOK_READY,
+        we inject a silent trigger so Gemini speaks first without waiting for user audio."""
+        self.turn_count += 1
+        self.current_user_text  = ""
+        self.current_tutor_text = ""
+        self.last_tutor_sent    = ""
+        self._yes_no_detected   = False
+        self._should_close      = False
+        # NOTE: _curiosity_intro_done intentionally NOT reset here
+        # It persists across turns within a session
+        self._audio_buf = bytearray()
+
+        # Build system instruction
+        rag = []
+        if self.phase == PHASE_TEXTBOOK and self.topic:
+            rag = textbook_store.search(self.topic, top_k=3)
+            self.last_rag = rag
+
+        instruction = instr_for_phase(
+            phase=self.phase, stage=self.stage, topic=self.topic,
+            history=self.history, rag=rag,
+            book_name=self.active_book_name,
+        )
+        print(f"[SERVER] begin_turn #{self.turn_count} phase={self.phase}")
+        await self._open(instruction)
+
+        # For phases where Gemini should speak first, send a text trigger.
+        SPEAK_FIRST_PHASES = {
+            PHASE_GREETING:        "Please greet the student warmly and ask: do you have a textbook you would like to study with today?",
+            PHASE_AWAITING_UPLOAD: "Please tell the student to scan the QR code on the screen to upload their textbook PDF.",
+            PHASE_CURIOSITY:       "The student chose curiosity mode and has no textbook. Immediately say: No problem! What topic are you curious about today? Be warm and encouraging. 1-2 sentences only.",
+        }
+        # textbook_ready: user speaks first, Gemini responds to their topic
+        # Curiosity intro: only fire ONCE (first turn after entering curiosity mode)
+        is_curiosity_intro = (self.phase == PHASE_CURIOSITY and 
+                               not self._curiosity_intro_done and
+                               not self.topic)
+        if is_curiosity_intro:
+            self._curiosity_intro_done = True
+            print(f"[SERVER] curiosity intro turn (intro_done → True)")
+        elif self.phase == PHASE_CURIOSITY:
+            print(f"[SERVER] curiosity turn (intro_done={self._curiosity_intro_done}, topic={self.topic!r})")
+
+        should_speak_first = (self.phase in SPEAK_FIRST_PHASES and
+                               self.phase != PHASE_CURIOSITY) or is_curiosity_intro
+        if should_speak_first:
+            await asyncio.sleep(0.3)
+            trigger_text = SPEAK_FIRST_PHASES[self.phase]
+            print(f"[SERVER] Sending text trigger for phase={self.phase}...")
+            if self._live_session is None:
+                print(f"[SERVER] ERROR: live_session is None! Cannot send trigger.")
+            else:
+                try:
+                    await self._live_session.send_client_content(
+                        turns=[{"role": "user", "parts": [{"text": trigger_text}]}],
+                        turn_complete=True,
+                    )
+                    print(f"[SERVER] Sent text trigger for phase={self.phase}: {trigger_text[:60]}")
+                except Exception as e:
+                    print(f"[SERVER] send_client_content ERROR: {e}")
+                    import traceback; traceback.print_exc()
+
+    async def send_audio(self, pcm: bytes, mime: str = "audio/pcm;rate=16000"):
+        if self._live_session:
+            await self._live_session.send_realtime_input(
+                audio=types.Blob(data=pcm, mime_type=mime))
+
+    async def end_turn(self):
+        if self._live_session:
+            await self._live_session.send_realtime_input(
+                activity_end=types.ActivityEnd())
+
+    async def set_phase(self, phase: str):
+        self.phase = phase
+        await self._send({"type": "phase", "value": phase})
+        print(f"[SERVER] set_phase → {phase}")
+
+    async def notify_upload(self, book_id: str, book_name: str):
+        self.active_book_id   = book_id
+        self.active_book_name = book_name
+        self.phase = PHASE_TEXTBOOK_READY
+        await self._send({"type": "show_qr",           "value": False})
+        await self._send({"type": "textbook_received", "name":  book_name})
+        await self._send({"type": "phase",             "value": self.phase})
+        print(f"[SERVER] textbook uploaded → phase={self.phase}")
+        # Pi will receive textbook_received → auto-trigger next turn
+
+    async def reset_topic(self):
+        await self._close()
+        self.topic = ""; self.stage = 1; self.turn_count = 0
+        self.history = []; self.last_rag = []
+        await self._send({"type": "state", "value": "ready"})
+
+    async def reset_session(self):
+        await self._close()
+        self.phase = PHASE_IDLE; self.topic = ""; self.stage = 1
+        self.turn_count = 0; self.history = []
+        self.active_book_id = ""; self.active_book_name = ""; self.last_rag = []
+        self._curiosity_intro_done = False
+        await self._send({"type": "state", "value": "ready"})
+        await self._send({"type": "phase", "value": self.phase})
+
+    async def close(self):
+        await self._close()
+
+
+# ═══════════════════════════════════
+# Active bridges registry
+# ═══════════════════════════════════
+_bridges: dict[str, LiveSessionBridge] = {}
+_device_events: dict[str, asyncio.Queue] = {}
+
+
+# ═══════════════════════════════════
+# HTTP endpoints
+# ═══════════════════════════════════
 
 @app.get("/")
 async def root():
-    return JSONResponse({
-        "status": "ok",
-        "service": "SocratiDesk",
-        "model": MODEL_NAME,
-        "voice": VOICE_NAME,
-        "features": {
-            "firestore": FIRESTORE_ENABLED,
-            "gcs": GCS_ENABLED,
-            "pdf": PDF_SUPPORT,
-            "barge_in": True,
-            "vision": True,
-        },
-        "textbooks": textbook_store.list_books(),
-    })
-
+    return JSONResponse({"status": "ok", "service": "SocratiDesk",
+                         "model": MODEL_NAME, "voice": VOICE_NAME,
+                         "textbooks": textbook_store.list_books()})
 
 @app.post("/upload-textbook")
-async def upload_textbook(file: UploadFile = File(...)):
-    """Upload textbook → GCS → extract pages → chunk → Firestore + in-memory RAG."""
+async def upload_textbook(file: UploadFile = File(...), device_id: str = "default"):
     filename = file.filename or "unknown"
-    suffix = Path(filename).suffix.lower()
-
+    suffix   = Path(filename).suffix.lower()
     if suffix not in (".pdf", ".txt", ".md"):
-        return JSONResponse({"error": f"Unsupported: {suffix}. Use .pdf or .txt"}, status_code=400)
+        return JSONResponse({"error": f"Unsupported: {suffix}"}, status_code=400)
 
-    # Save locally
     save_path = UPLOAD_DIR / filename
-    content = await file.read()
-    save_path.write_bytes(content)
+    save_path.write_bytes(await file.read())
 
-    # Upload to GCS
-    gcs_uri = upload_to_gcs(str(save_path), filename)
-
-    # Extract pages
     try:
         if suffix == ".pdf":
-            pages = extract_pages_from_pdf(str(save_path))
+            if not PDF_SUPPORT:
+                return JSONResponse({"error": "pdfplumber not installed"}, status_code=500)
+            pages = []
+            with pdfplumber.open(str(save_path)) as pdf:
+                for i, pg in enumerate(pdf.pages):
+                    t = pg.extract_text() or ""
+                    if t.strip(): pages.append({"page": i+1, "text": t})
         else:
-            text = save_path.read_text(encoding="utf-8", errors="replace")
-            pages = [{"page": 1, "text": text}]
+            pages = [{"page": 1, "text": save_path.read_text(encoding="utf-8", errors="replace")}]
     except Exception as e:
-        return JSONResponse({"error": f"Extraction failed: {e}"}, status_code=500)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
     if not pages:
         return JSONResponse({"error": "No text extracted"}, status_code=400)
 
-    # Store in RAG
-    book_id = re.sub(r"[^a-z0-9_-]", "_", filename.lower())
-    num_chunks = textbook_store.add_book(book_id, filename, pages)
+    book_id   = re.sub(r"[^a-z0-9_-]", "_", filename.lower())
+    n_chunks  = textbook_store.add_book(book_id, filename, pages)
 
-    # Persist to Firestore
-    await save_to_firestore(book_id, filename, pages)
+    bridge = _bridges.get(device_id)
+    if bridge and bridge.phase == PHASE_AWAITING_UPLOAD:
+        await bridge.notify_upload(book_id, filename)
 
-    return JSONResponse({
-        "status": "ok",
-        "book_id": book_id,
-        "name": filename,
-        "pages": len(pages),
-        "chunks": num_chunks,
-        "gcs_uri": gcs_uri,
-    })
+    if device_id in _device_events:
+        await _device_events[device_id].put(
+            {"type": "textbook_uploaded", "book_id": book_id,
+             "name": filename, "pages": len(pages), "chunks": n_chunks})
 
+    return JSONResponse({"status": "ok", "book_id": book_id, "name": filename,
+                         "pages": len(pages), "chunks": n_chunks})
 
 @app.get("/textbooks")
 async def list_textbooks():
     return JSONResponse({"textbooks": textbook_store.list_books()})
 
-
-@app.delete("/textbook/{book_id}")
-async def delete_textbook(book_id: str):
-    textbook_store.remove_book(book_id)
-    return JSONResponse({"status": "ok", "deleted": book_id})
-
-
-# ═══════════════════════════════════════════
-# Device Notification (QR upload flow)
-# ═══════════════════════════════════════════
-
-# In-memory event queues per device (for long-polling)
-_device_events: dict[str, asyncio.Queue] = {}
-
-
-@app.post("/notify-device")
-async def notify_device(request: Request):
-    """Called by mobile upload page after successful upload.
-    Pushes an event to the Pi device's long-poll queue."""
-    data = await request.json()
-    device_id = data.get("device_id", "")
-    if device_id and device_id in _device_events:
-        await _device_events[device_id].put(data)
-    return JSONResponse({"status": "ok"})
-
-
-@app.get("/wait-for-upload")
-async def wait_for_upload(device_id: str = "socratiDesk-001"):
-    """Long-poll endpoint. Pi calls this and blocks until a textbook is uploaded.
-    Returns immediately if an event is already queued."""
-    if device_id not in _device_events:
-        _device_events[device_id] = asyncio.Queue()
-
-    queue = _device_events[device_id]
-    try:
-        event = await asyncio.wait_for(queue.get(), timeout=55.0)
-        return JSONResponse(event)
-    except asyncio.TimeoutError:
-        return JSONResponse({"event": "timeout"}, status_code=204)
-
-
-# ═══════════════════════════════════════════
-# Mobile Upload Page (QR scan flow)
-# ═══════════════════════════════════════════
-
-UPLOAD_HTML_PATH = Path(__file__).parent / "upload.html"
-
-
 @app.get("/upload", response_class=HTMLResponse)
-async def upload_page(session: str = "default"):
-    """Serve the mobile upload page. QR code on Pi points here."""
-    if UPLOAD_HTML_PATH.exists():
-        html = UPLOAD_HTML_PATH.read_text(encoding="utf-8")
-    else:
-        html = "<h1>Upload page not found</h1><p>Ensure upload.html is deployed alongside main.py</p>"
-    return HTMLResponse(html)
+async def upload_page():
+    p = Path(__file__).parent / "upload.html"
+    return HTMLResponse(p.read_text(encoding="utf-8") if p.exists() else "<h1>upload.html not found</h1>")
 
-
-# WebSocket hub for upload notifications (Pi subscribes, mobile publishes)
 _upload_notify_clients: dict[str, list[WebSocket]] = {}
-
 
 @app.websocket("/upload-notify")
 async def upload_notify_ws(websocket: WebSocket, session: str = "default"):
-    """WebSocket for real-time upload notifications.
-    - Pi device connects and waits for events.
-    - Mobile upload page connects and sends upload-complete events.
-    Both sides use the same session ID to match."""
     await websocket.accept()
-
-    if session not in _upload_notify_clients:
-        _upload_notify_clients[session] = []
-    _upload_notify_clients[session].append(websocket)
-
+    _upload_notify_clients.setdefault(session, []).append(websocket)
     try:
         while True:
-            raw = await websocket.receive_text()
-            msg = json.loads(raw)
-
-            # Broadcast to all other clients in this session (Pi gets the notification)
+            msg = json.loads(await websocket.receive_text())
             for ws in _upload_notify_clients.get(session, []):
                 if ws is not websocket:
-                    try:
-                        await ws.send_text(json.dumps(msg))
-                    except Exception:
-                        pass
-
-            # Also push to long-poll queue as fallback
+                    try: await ws.send_text(json.dumps(msg))
+                    except: pass
             if msg.get("type") == "textbook_uploaded":
-                device_id = session
-                if device_id in _device_events:
-                    await _device_events[device_id].put(msg)
-
+                bridge = _bridges.get(session)
+                if bridge and bridge.phase == PHASE_AWAITING_UPLOAD:
+                    await bridge.notify_upload(msg.get("book_id",""), msg.get("name","textbook"))
     except WebSocketDisconnect:
         pass
-    except Exception:
-        pass
     finally:
-        if session in _upload_notify_clients:
-            _upload_notify_clients[session] = [
-                ws for ws in _upload_notify_clients[session] if ws is not websocket
-            ]
+        _upload_notify_clients[session] = [
+            w for w in _upload_notify_clients.get(session,[]) if w is not websocket]
 
 
-# ═══════════════════════════════════════════
-# WebSocket Endpoint (Main Live Session)
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════
+# Main WebSocket endpoint
+# ═══════════════════════════════════
 
 @app.websocket("/live")
-async def live_endpoint(websocket: WebSocket):
+async def live_ws(websocket: WebSocket):
     await websocket.accept()
-    bridge = LiveSessionBridge(websocket)
+    device_id = websocket.query_params.get("device_id", "default")
+    bridge    = LiveSessionBridge(websocket, device_id)
+    _bridges[device_id] = bridge
+    print(f"[SERVER] Pi connected: device_id={device_id}")
 
     try:
-        await bridge._send({"type": "state", "value": "ready"})
+        await bridge._send({"type": "state",     "value": "ready"})
+        await bridge._send({"type": "phase",     "value": bridge.phase})
         await bridge._send({"type": "textbooks", "value": textbook_store.list_books()})
 
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
-            msg_type = msg.get("type")
+            t   = msg.get("type")
 
-            if msg_type == "hello":
+            if t == "hello":
+                print(f"[SERVER] hello from {msg.get('device','?')}")
                 await bridge._send({"type": "state", "value": "ready"})
+                await bridge._send({"type": "phase", "value": bridge.phase})
 
-            elif msg_type == "set_mode":
-                mode = msg.get("mode")
-                if mode in ("curiosity", "textbook"):
-                    bridge.mode = mode
-                    if mode == "textbook":
-                        book_id = msg.get("book_id")
-                        if book_id and book_id in textbook_store.books:
-                            bridge.active_book_id = book_id
-                            bridge.active_book_name = textbook_store.books[book_id]["name"]
-                        else:
-                            books = textbook_store.list_books()
-                            if books:
-                                bridge.active_book_id = books[0]["id"]
-                                bridge.active_book_name = books[0]["name"]
-                    await bridge._send({"type": "mode", "value": bridge.mode})
+            elif t == "start_turn":
+                print(f"[SERVER] start_turn received, phase={bridge.phase}")
+                try:
+                    await bridge.begin_turn()
+                    await bridge._send({"type": "state", "value": "listening"})
+                    print(f"[SERVER] begin_turn OK")
+                except Exception as e:
+                    import traceback
+                    print(f"[SERVER] begin_turn ERROR: {e}")
+                    traceback.print_exc()
+                    await bridge._send({"type": "error", "message": str(e)})
 
-            elif msg_type == "start_turn":
-                await bridge.begin_turn()
-                await bridge._send({"type": "state", "value": "listening"})
-
-            elif msg_type == "audio":
+            elif t == "audio":
+                pcm  = base64.b64decode(msg["data"])
                 mime = msg.get("mime_type", "audio/pcm;rate=16000")
-                pcm = base64.b64decode(msg["data"])
-                await bridge.send_audio(pcm, mime_type=mime)
+                await bridge.send_audio(pcm, mime)
 
-            elif msg_type == "image":
-                # Vision: accept camera frames
-                mime = msg.get("mime_type", "image/jpeg")
-                img_bytes = base64.b64decode(msg["data"])
-                await bridge.send_image(img_bytes, mime_type=mime)
-
-            elif msg_type == "end_turn":
-                await bridge.end_turn()
+            elif t == "end_turn":
+                # For Gemini-speaks-first phases, server already sent ActivityEnd
+                # via silence trigger — ignore Pi's end_turn to avoid double-close
+                if bridge.phase not in (PHASE_GREETING,
+                                          PHASE_AWAITING_UPLOAD, PHASE_TEXTBOOK_READY):
+                    await bridge.end_turn()
                 await bridge._send({"type": "state", "value": "thinking"})
 
-            elif msg_type == "reset_topic":
+            elif t == "set_phase":
+                await bridge.set_phase(msg.get("phase", PHASE_GREETING))
+
+            elif t == "vosk_answer":
+                answer = msg.get("answer", "")
+                print(f"[SERVER] vosk_answer: {answer!r} phase={bridge.phase}")
+                if bridge.phase == PHASE_AWAITING_MODE:
+                    if answer == "yes":
+                        await bridge._route_yes()
+                    elif answer == "no":
+                        await bridge._route_no()
+                    # Close Gemini session and notify Pi turn is done
+                    await bridge._close()
+                    await bridge._send({"type": "phase",        "value": bridge.phase})
+                    await bridge._send({"type": "state",        "value": "ready"})
+                    await bridge._send({"type": "turn_complete"})
+                    print(f"[SERVER] vosk_answer handled → phase={bridge.phase}")
+
+            elif t == "reset_topic":
                 await bridge.reset_topic()
 
-            elif msg_type == "reset_session":
+            elif t == "reset_session":
                 await bridge.reset_session()
 
             else:
-                await bridge._send({
-                    "type": "error",
-                    "message": f"Unknown type: {msg_type}"
-                })
+                print(f"[SERVER] unknown msg type: {t}")
 
     except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        try:
-            await bridge._send({"type": "error", "message": str(exc)})
-        except Exception:
-            pass
+        print(f"[SERVER] Pi disconnected: {device_id}")
+    except Exception as e:
+        print(f"[SERVER] error: {e}")
+        try: await bridge._send({"type": "error", "message": str(e)})
+        except: pass
     finally:
+        _bridges.pop(device_id, None)
         await bridge.close()
