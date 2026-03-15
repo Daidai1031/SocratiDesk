@@ -131,7 +131,8 @@ textbook_store = TextbookStore()
 
 PERSONA = """You are SocratiDesk, a warm encouraging voice-first AI study companion.
 Rules: speak conversationally, 2-3 short sentences max, no bullet points,
-use contractions, never say "as an AI"."""
+use contractions, never say "as an AI".
+IMPORTANT: The student always speaks English. Transcribe and respond in English only."""
 
 def instr_for_phase(phase, stage=1, topic="", history=None, rag=None, book_name=""):
     history = history or []
@@ -281,7 +282,9 @@ class LiveSessionBridge:
             "input_audio_transcription":  {},
             "output_audio_transcription": {},
             "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": VOICE_NAME}}},
-            "realtime_input_config": {"automatic_activity_detection": {"disabled": False}},
+            # Disable VAD — Pi controls turn boundaries via ActivityEnd
+            # This prevents Gemini from dropping user audio as "background noise"
+            "realtime_input_config": {"automatic_activity_detection": {"disabled": True}},
             "system_instruction": system_instruction,
         }
 
