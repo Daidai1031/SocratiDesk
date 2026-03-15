@@ -719,9 +719,10 @@ async def mic_sender(ws, mic, vosk):
     Auto-stops on silence when recording.
     """
     import numpy as np
-    SILENCE_THRESHOLD = 400    # lowered - 800 was cutting off quiet speech
+    SILENCE_THRESHOLD = 180    # quiet speech on Pi mics can sit around 200-350 RMS
     SILENCE_TIMEOUT   = 8.0    # seconds of silence before auto-stop
     MIN_RECORD_TIME   = 2.0    # min recording time before silence kicks in
+    MAX_GAIN          = 4.0
 
     last_sound_time = None
     record_start_time = None
@@ -736,6 +737,17 @@ async def mic_sender(ws, mic, vosk):
             rms = int(np.sqrt(np.mean(arr ** 2)))
         except Exception:
             rms = 0
+            arr = None
+
+        # Software gain for quiet speech before sending to Gemini.
+        # This helps avoid '<noise>' transcriptions when mic level is low.
+        if arr is not None and state.recording and rms > 0:
+            target_rms = 1200.0
+            gain = max(1.0, min(MAX_GAIN, target_rms / max(rms, 1)))
+            if gain > 1.05:
+                boosted = np.clip(arr * gain, -32768, 32767).astype(np.int16)
+                chunk = boosted.tobytes()
+                rms = int(np.sqrt(np.mean(boosted.astype(np.float32) ** 2)))
 
         # Feed Vosk:
         # - When idle: wake word detection only
