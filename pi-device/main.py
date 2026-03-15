@@ -301,6 +301,8 @@ class AssistantState:
         self.turn_count = 0
         self.partial_tutor_text = ""
         self.last_printed_tutor_text = ""
+        self.partial_user_text = ""
+        self.last_printed_user_text = ""
         self.last_user_transcript = ""
         self.available_textbooks = []
         self.curiosity_intro_done = False
@@ -399,6 +401,7 @@ async def _do_start_recording(ws):
     _mic_ref.clear_queue()
     state.turn_count += 1
     state.partial_tutor_text = ""
+    state.partial_user_text = ""
     state.turn_in_progress = True
     await send_json(ws, {"type": "start_turn"})
 
@@ -521,10 +524,14 @@ async def receiver(ws, speaker, vosk):
             speaker.add_pcm16(pcm)
 
         elif t == "user_transcript":
-            text = re.sub(r"<[^>]+>", "", (data.get("value") or "")).strip()
-            if text:
-                print(f"\r  YOU:   {text:<60}", end="", flush=True)
-                state.last_user_transcript = text
+            raw_text = (data.get("value") or "").strip()
+            clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
+            if raw_text and raw_text != state.partial_user_text:
+                state.partial_user_text = raw_text
+                state.last_user_transcript = clean_text or raw_text
+                print(f"\n  YOU:   {state.last_user_transcript}")
+                if clean_text and clean_text != raw_text:
+                    print(f"  [ASR RAW] {raw_text}")
 
         elif t == "tutor_transcript":
             text = (data.get("value") or "").strip()
@@ -542,6 +549,11 @@ async def receiver(ws, speaker, vosk):
 
         elif t == "turn_complete":
             print()
+            if state.last_user_transcript:
+                user_final = state.last_user_transcript.strip()
+                if user_final and user_final != state.last_printed_user_text:
+                    print(f"  [USER FINAL] {user_final}")
+                    state.last_printed_user_text = user_final
             if state.partial_tutor_text:
                 final = state.partial_tutor_text.strip()
                 if final and final != state.last_printed_tutor_text:
@@ -560,6 +572,7 @@ async def receiver(ws, speaker, vosk):
             state.turn_in_progress = False
             state.receiving_audio = False
             state.partial_tutor_text = ""
+            state.partial_user_text = ""
 
             # Auto-start next recording AFTER audio finishes playing
             # AWAITING_UPLOAD excluded — user is uploading via phone
@@ -627,6 +640,7 @@ async def start_recording(ws, mic, speaker):
     mic.clear_queue()
     state.turn_count += 1
     state.partial_tutor_text = ""
+    state.partial_user_text = ""
     await send_json(ws, {"type": "start_turn"})
     # mic is already running (started at boot for Vosk)
     state.recording = True
@@ -674,7 +688,9 @@ async def command_loop(ws, mic, speaker, keyboard):
             await send_json(ws, {"type": "reset_topic"})
             state.topic = ""
             state.partial_tutor_text = ""
+            state.partial_user_text = ""
             state.last_printed_tutor_text = ""
+            state.last_printed_user_text = ""
             state.turn_count = 0
             print("  [RESET] Topic reset.\n")
 
@@ -686,7 +702,9 @@ async def command_loop(ws, mic, speaker, keyboard):
             state.topic = ""
             state.stage = 1
             state.partial_tutor_text = ""
+            state.partial_user_text = ""
             state.last_printed_tutor_text = ""
+            state.last_printed_user_text = ""
             state.turn_count = 0
             tft.show_idle()
             print("  [RESET] Full reset. Say 'Hey Socrati' to start.\n")
