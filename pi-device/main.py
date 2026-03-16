@@ -117,7 +117,6 @@ class VoskWakeWord:
                 pass
 
     @staticmethod
-    @staticmethod
     def _is_yes(text):
         words = text.strip().split()
         # ONLY unambiguous first-word YES - never phrases Gemini might say
@@ -230,10 +229,12 @@ class TFTDisplay:
             self.draw.text((10, 58), line2, font=self.font_sm, fill=(180, 180, 180))
         self._push()
 
-    def show_qr(self, url: str):
+    def show_qr(self, url: str, label=None):
         if not self._available:
             print(f"[TFT] QR URL: {url}")
             return
+        if label is None:
+            label = ["Scan to", "upload", "textbook"]
         try:
             import qrcode
             from PIL import Image, ImageDraw
@@ -248,10 +249,8 @@ class TFTDisplay:
             self.draw = ImageDraw.Draw(self.img)
             self.img.paste(qr_img, (2, 2))
             tx = 137
-            self.draw.text((tx, 8),  "Scan to",   font=self.font_sm, fill=(100, 220, 160))
-            self.draw.text((tx, 24), "upload",     font=self.font_sm, fill=(100, 220, 160))
-            self.draw.text((tx, 40), "textbook",   font=self.font_sm, fill=(100, 220, 160))
-            self.draw.text((tx, 70), "Waiting...", font=self.font_sm, fill=(180, 180, 100))
+            for i, line in enumerate(label[:4]):
+                self.draw.text((tx, 8 + i * 16), line, font=self.font_sm, fill=(100, 220, 160))
             self._push()
         except Exception as e:
             print(f"[TFT] QR error: {e}")
@@ -306,6 +305,8 @@ class AssistantState:
         self.last_user_transcript = ""
         self.available_textbooks = []
         self.curiosity_intro_done = False
+        self.textbook_intro_done = False
+        self.topic_complete = False
 
     def phase_label(self):
         labels = {
@@ -314,7 +315,7 @@ class AssistantState:
             PHASE_AWAITING_MODE:   "Waiting for yes/no",
             PHASE_AWAITING_UPLOAD: "Waiting for PDF upload",
             PHASE_TEXTBOOK_READY:  "Textbook ready - ask a topic",
-            PHASE_TEXTBOOK:        f"Textbook study (stage {self.stage}/3)",
+            PHASE_TEXTBOOK:        f"Textbook study (stage {self.stage}/4)",
             PHASE_CURIOSITY:       f"Curiosity mode (stage {self.stage}/3)",
         }
         return labels.get(self.phase, self.phase)
@@ -326,6 +327,7 @@ _ws_ref = None
 _loop_ref = None
 _mic_ref = None
 _speaker_ref = None
+_vosk_ref = None
 
 
 # ═══════════════════════════════════════════
@@ -377,18 +379,46 @@ async def _trigger_wake():
 
 async def _wait_then_listen(ws):
     """Wait for speaker to finish playing, then start next recording turn."""
-    # Poll speaker queue until empty (audio finished playing)
     if _speaker_ref is not None:
         waited = 0
-        while waited < 8.0:  # max 8s wait
+        while waited < 10.0:
             qsize = _speaker_ref.byte_queue.qsize()
             pending = len(_speaker_ref.pending)
             if qsize == 0 and pending == 0:
                 break
             await asyncio.sleep(0.1)
             waited += 0.1
-        # Extra buffer for speaker hardware to finish
-        await asyncio.sleep(0.5)
+        # Wait longer after speaker to avoid echo pickup
+        await asyncio.sleep(1.5)
+
+    # Don't auto-listen after topic is complete
+    if state.topic_complete:
+        state.topic_complete = False
+        state.phase = PHASE_IDLE
+        state.topic = ""
+        state.stage = 1
+        state.textbook_intro_done = False
+        state.curiosity_intro_done = False
+
+        progress_url = f"{HTTP_URL}/progress?device_id={DEVICE_ID}&session={DEVICE_ID}"
+        print(f"  [TOPIC DONE] Scan for summary: {progress_url}")
+
+        # Tell server we're going idle (but don't clear session history)
+        await send_json(ws, {"type": "set_phase", "phase": PHASE_IDLE})
+
+        # Show "Topic done!" then QR to progress page
+        tft.show_status("Great job!", "Scan QR for summary", color=(100, 220, 160))
+        await asyncio.sleep(2)
+        tft.show_qr(progress_url, label=["Scan for", "your learning", "summary!"])
+
+        # Wait 10 seconds, then go back to idle
+        await asyncio.sleep(10)
+        tft.show_idle()
+        # Resume Vosk so "Hey Socrati" works again
+        if _vosk_ref is not None:
+            _vosk_ref.resume()
+        print(f"  [IDLE] Say 'Hey Socrati' to start a new topic\n")
+        return
 
     print(f"  [AUTO-LISTEN] Audio done, starting next turn for phase={state.phase}")
     await _do_start_recording(ws)
@@ -405,19 +435,24 @@ async def _do_start_recording(ws):
     state.turn_in_progress = True
     await send_json(ws, {"type": "start_turn"})
 
-    # These phases: Gemini speaks first via text trigger — Pi just waits.
-    # awaiting_mode is NOT here — user speaks first in that phase.
-    # GREETING and AWAITING_UPLOAD: Gemini speaks first via text trigger
-    # All other phases: user speaks first
-    # Gemini speaks first in these phases/conditions
-    # Gemini speaks first only for: greeting, awaiting_upload, curiosity intro (once)
+    # Gemini speaks first in these phases/conditions:
+    # - GREETING: always
+    # - AWAITING_UPLOAD: always  
+    # - TEXTBOOK_READY: only FIRST time (confirm book receipt)
+    # - CURIOSITY: only FIRST time (ask what topic)
     is_curiosity_intro = (state.phase == PHASE_CURIOSITY and 
                            not state.topic and 
                            not state.curiosity_intro_done)
     if is_curiosity_intro:
-        state.curiosity_intro_done = True  # mark intro as done
-    GEMINI_SPEAKS_FIRST = (PHASE_GREETING, PHASE_AWAITING_UPLOAD)
-    if state.phase in GEMINI_SPEAKS_FIRST or is_curiosity_intro:
+        state.curiosity_intro_done = True
+
+    is_textbook_intro = (state.phase == PHASE_TEXTBOOK_READY and
+                          not state.textbook_intro_done)
+    if is_textbook_intro:
+        state.textbook_intro_done = True
+
+    ALWAYS_SPEAK_FIRST = (PHASE_GREETING, PHASE_AWAITING_UPLOAD)
+    if state.phase in ALWAYS_SPEAK_FIRST or is_curiosity_intro or is_textbook_intro:
         print(f"\n  [TURN {state.turn_count}] {state.phase_label()} — waiting for Gemini...")
         return
 
@@ -489,7 +524,7 @@ async def receiver(ws, speaker, vosk):
                 if new in (PHASE_IDLE, PHASE_AWAITING_MODE):
                     vosk.resume()
                 else:
-                    vosk.pause()  # Gemini handles all speech in dialogue phases
+                    vosk.pause()
 
         elif t == "textbooks":
             state.available_textbooks = data.get("value", [])
@@ -508,11 +543,17 @@ async def receiver(ws, speaker, vosk):
             else:
                 tft.show_status("Ready to study!", state.topic or "")
 
+        # v3: Server tells Pi to stop recording (e.g. after yes/no detected)
+        elif t == "stop_recording":
+            if state.recording:
+                state.recording = False
+                print(f"\n  [STOP] Server requested stop recording")
+
         elif t == "textbook_received":
             name = data.get("name", "")
             print(f"\n  [UPLOAD] Received: {name}")
             tft.show_textbook_received(name)
-            # Brief pause then start recording so user can say their topic
+            # Brief pause then start recording so server can confirm book
             if _ws_ref is not None:
                 asyncio.ensure_future(_wait_then_listen(_ws_ref))
 
@@ -546,6 +587,9 @@ async def receiver(ws, speaker, vosk):
             pages = data.get("textbook_pages", [])
             if pages:
                 print(f"\n  [PAGES] {pages}")
+            if data.get("topic_complete"):
+                state.topic_complete = True
+                print(f"  [TOPIC COMPLETE] Socratic dialogue finished")
 
         elif t == "turn_complete":
             print()
@@ -575,7 +619,6 @@ async def receiver(ws, speaker, vosk):
             state.partial_user_text = ""
 
             # Auto-start next recording AFTER audio finishes playing
-            # AWAITING_UPLOAD excluded — user is uploading via phone
             AUTO_LISTEN_PHASES = [
                 PHASE_GREETING, PHASE_AWAITING_MODE,
                 PHASE_TEXTBOOK_READY, PHASE_TEXTBOOK, PHASE_CURIOSITY,
@@ -601,12 +644,11 @@ def _handle_phase_ui(phase):
     elif phase == PHASE_AWAITING_MODE:
         tft.show_status("Have a textbook?", "Say yes or no")
     elif phase == PHASE_AWAITING_UPLOAD:
-        # Show QR immediately when phase changes
         _show_qr_ui()
     elif phase == PHASE_TEXTBOOK_READY:
         tft.show_status("Textbook loaded!", "What topic?")
     elif phase == PHASE_TEXTBOOK:
-        tft.show_status("Textbook mode", f"Stage {state.stage}/3")
+        tft.show_status("Textbook mode", f"Stage {state.stage}/4")
     elif phase == PHASE_CURIOSITY:
         tft.show_status("Curiosity mode", f"Stage {state.stage}/3")
 
@@ -622,7 +664,7 @@ def _show_qr_ui():
         qr.print_ascii(invert=True)
     except Exception:
         pass
-    tft.show_qr(url)
+    tft.show_qr(url, label=["Scan to", "upload", "textbook", "Waiting..."])
 
 
 # ═══════════════════════════════════════════
@@ -642,7 +684,6 @@ async def start_recording(ws, mic, speaker):
     state.partial_tutor_text = ""
     state.partial_user_text = ""
     await send_json(ws, {"type": "start_turn"})
-    # mic is already running (started at boot for Vosk)
     state.recording = True
     state.turn_in_progress = True
     print(f"\n{'='*52}")
@@ -656,7 +697,6 @@ async def start_recording(ws, mic, speaker):
 async def stop_recording(ws, mic):
     if not state.recording:
         return
-    # Do NOT stop mic — keep running for Vosk wake word detection
     state.recording = False
     await send_json(ws, {"type": "end_turn"})
     print("  [MIC] Stopped - processing...")
@@ -706,6 +746,9 @@ async def command_loop(ws, mic, speaker, keyboard):
             state.last_printed_tutor_text = ""
             state.last_printed_user_text = ""
             state.turn_count = 0
+            state.curiosity_intro_done = False
+            state.textbook_intro_done = False
+            state.topic_complete = False
             tft.show_idle()
             print("  [RESET] Full reset. Say 'Hey Socrati' to start.\n")
 
@@ -737,40 +780,36 @@ async def mic_sender(ws, mic, vosk):
     Auto-stops on silence when recording.
     """
     import numpy as np
-    SILENCE_THRESHOLD = 180    # quiet speech on Pi mics can sit around 200-350 RMS
-    SILENCE_TIMEOUT   = 8.0    # seconds of silence before auto-stop
-    MIN_RECORD_TIME   = 2.0    # min recording time before silence kicks in
+    SILENCE_THRESHOLD = 1500    # Raw RMS below this = silence (your mic noise floor is ~1000)
+    SPEECH_THRESHOLD  = 2500    # Raw RMS above this = confirmed speech
+    SILENCE_TIMEOUT   = 2.0     # Seconds of silence after speech to auto-stop
+    MIN_RECORD_TIME   = 1.5
     MAX_GAIN          = 4.0
 
     last_sound_time = None
     record_start_time = None
+    speech_detected = False
 
     while state.running:
         chunk = await mic.get_chunk()
         now = asyncio.get_event_loop().time()
 
-        # Compute RMS first (used for silence detection and debug)
         try:
             arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-            rms = int(np.sqrt(np.mean(arr ** 2)))
+            raw_rms = int(np.sqrt(np.mean(arr ** 2)))
         except Exception:
-            rms = 0
+            raw_rms = 0
             arr = None
 
-        # Software gain for quiet speech before sending to Gemini.
-        # This helps avoid '<noise>' transcriptions when mic level is low.
-        if arr is not None and state.recording and rms > 0:
+        # Apply gain boost ONLY for audio sent to Gemini (not for silence detection)
+        send_chunk = chunk
+        if arr is not None and state.recording and raw_rms > 0:
             target_rms = 1200.0
-            gain = max(1.0, min(MAX_GAIN, target_rms / max(rms, 1)))
+            gain = max(1.0, min(MAX_GAIN, target_rms / max(raw_rms, 1)))
             if gain > 1.05:
                 boosted = np.clip(arr * gain, -32768, 32767).astype(np.int16)
-                chunk = boosted.tobytes()
-                rms = int(np.sqrt(np.mean(boosted.astype(np.float32) ** 2)))
+                send_chunk = boosted.tobytes()
 
-        # Feed Vosk:
-        # - When idle: wake word detection only
-        # - When recording in awaiting_mode AND at least 1.5s in: yes/no detection
-        #   (prevents Gemini echo from triggering yes/no at start of recording)
         is_awaiting_mode_recording = (state.recording and 
                                        state.phase == PHASE_AWAITING_MODE and
                                        record_start_time is not None and
@@ -783,44 +822,48 @@ async def mic_sender(ws, mic, vosk):
         if not state.recording:
             last_sound_time = None
             record_start_time = None
+            speech_detected = False
             continue
 
-        # ── Active recording: send to Gemini ──
         if record_start_time is None:
             record_start_time = now
-            print(f"  [AUDIO] Recording started, RMS threshold={SILENCE_THRESHOLD}")
+            speech_detected = False
+            print(f"  [AUDIO] Recording started, silence={SILENCE_THRESHOLD} speech={SPEECH_THRESHOLD}")
 
         await send_json(ws, {
             "type": "audio",
             "mime_type": "audio/pcm;rate=16000",
-            "data": base64.b64encode(chunk).decode("ascii"),
+            "data": base64.b64encode(send_chunk).decode("ascii"),
         })
 
-        # Print RMS so we can tune threshold
+        # Use raw_rms (before gain) for silence detection
         if int(now * 4) % 8 == 0:
-            bar = "█" * min(20, rms // 100)
-            print(f"\r  [RMS={rms:4d}] {bar:<20}", end="", flush=True)
+            bar = "█" * min(20, raw_rms // 100)
+            tag = "SPEECH" if raw_rms > SPEECH_THRESHOLD else ("quiet" if raw_rms < SILENCE_THRESHOLD else "")
+            print(f"\r  [RMS={raw_rms:4d}] {bar:<20} {tag}", end="", flush=True)
 
-        if rms > SILENCE_THRESHOLD:
+        if raw_rms > SILENCE_THRESHOLD:
             last_sound_time = now
-        elif last_sound_time is None:
+        if raw_rms > SPEECH_THRESHOLD:
+            speech_detected = True
+        if last_sound_time is None:
             last_sound_time = now
 
         elapsed = now - record_start_time
         silence_dur = now - (last_sound_time or now)
 
-        # awaiting_mode: no auto-stop - wait for Vosk yes/no or manual Enter
-        # All other phases: auto-stop on silence
+        # Only auto-stop AFTER user has actually spoken (speech_detected=True)
         if state.phase != PHASE_AWAITING_MODE:
-            if elapsed > MIN_RECORD_TIME and silence_dur >= SILENCE_TIMEOUT:
-                print(f"\n  [AUTO-STOP] {silence_dur:.1f}s silence - stopping")
+            if speech_detected and elapsed > MIN_RECORD_TIME and silence_dur >= SILENCE_TIMEOUT:
+                print(f"\n  [AUTO-STOP] {silence_dur:.1f}s silence after speech (raw_rms={raw_rms})")
                 await stop_recording(ws, mic)
                 last_sound_time = None
                 record_start_time = None
+                speech_detected = False
 
 
 async def run_client():
-    global _ws_ref, _loop_ref, _mic_ref, _speaker_ref
+    global _ws_ref, _loop_ref, _mic_ref, _speaker_ref, _vosk_ref
     _loop_ref = asyncio.get_running_loop()
 
     keyboard = KeyboardController(_loop_ref)
@@ -832,11 +875,11 @@ async def run_client():
     _mic_ref = mic
     _speaker_ref = speaker
 
-    # Start mic immediately so Vosk always gets audio (even before recording)
     mic.start()
 
     vosk = VoskWakeWord(VOSK_MODEL_PATH, on_wake_word, response_callback=on_vosk_response)
     vosk.start()
+    _vosk_ref = vosk
 
     sep = "&" if "?" in WS_URL else "?"
     ws_url = f"{WS_URL}{sep}device_id={DEVICE_ID}"
