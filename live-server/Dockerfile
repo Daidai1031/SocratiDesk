@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY upload.html .
+COPY progress.html .
 
 RUN mkdir -p /tmp/textbooks
 

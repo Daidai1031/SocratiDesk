@@ -18,7 +18,7 @@ SocratiDesk is a dedicated voice-first AI study companion that sits on a student
 
 Two learning modes:
 - **Curiosity Mode** — Free exploration of any topic with a 3-stage Socratic dialogue
-- **Textbook Mode** — Guided study from an uploaded PDF, directing students to specific pages
+- **Textbook Mode** — Guided study from an uploaded PDF with a 4-stage learning cycle
 
 The device has no keyboard, no browser, no distractions. Just a microphone, a speaker, and a small screen.
 
@@ -37,14 +37,26 @@ Tutor:   "Hey there! Do you have a textbook you'd like to study with today?"
          │  [Student scans, uploads PDF from phone]       │
          │  Tutor: "Got it! What topic shall we start?"   │
          │                                                │
-         │  → Textbook-Guided Mode (3 stages)             │
-         │    Stage 1: "Open to page 5, read the          │
-         │             pH scale section."                  │
-         │    Stage 2: "Good! Your book mentions pH 7     │
-         │             is neutral. What makes lemon        │
-         │             juice acidic?"                      │
-         │    Stage 3: "Exactly — acids release H+ ions.  │
-         │             Review the indicator section!"      │
+         │  → Textbook-Guided Mode (4 stages)             │
+         │                                                │
+         │    Stage 1 — Page Direction:                   │
+         │      "Open to page 12, look at the middle      │
+         │       section. You'll find the pH scale there. │
+         │       Read it and tell me what you understand."│
+         │                                                │
+         │    Stage 2 — Feedback & Summary:               │
+         │      "Good understanding! The textbook also    │
+         │       mentions that pH 7 is neutral. Acids     │
+         │       have pH below 7, bases above 7."         │
+         │                                                │
+         │    Stage 3 — Comprehension Check:              │
+         │      "Quick check — if lemon juice has a pH    │
+         │       of 2, is it an acid or a base?"          │
+         │                                                │
+         │    Stage 4 — Final Feedback:                   │
+         │      "That's right, lemon juice is acidic!     │
+         │       Great job understanding pH. Check page   │
+         │       12 for more on indicators!"              │
          │                                                │
          └────────────────────────────────────────────────┘
 
@@ -63,6 +75,35 @@ Tutor:   "Hey there! Do you have a textbook you'd like to study with today?"
          │                                                │
          └────────────────────────────────────────────────┘
 ```
+
+---
+
+## Conversation Phases (State Machine)
+
+| Phase | Trigger | Tutor Behavior |
+|---|---|---|
+| `greeting` | User says "Hi Socrati/Socratic" | Greets warmly, asks "Do you have a textbook?" |
+| `awaiting_mode` | After greeting | Listens for "yes" or "no" |
+| `awaiting_upload` | User says "yes" + no book uploaded | Says "Scan the QR code", Pi shows QR |
+| `textbook_ready` | Book uploaded or already available | Confirms book received, asks first question |
+| `curiosity_greeting` | User says "no" | Welcomes to curiosity mode, asks first question |
+
+### Textbook Mode — 4-Stage Learning Cycle
+
+| Stage | Name | Tutor Behavior |
+|---|---|---|
+| Stage 1 | **Page Direction** | RAG retrieves relevant pages. Tutor tells student which page and section to open, describes what they'll find, asks them to read and report back. |
+| Stage 2 | **Feedback & Summary** | Evaluates student's understanding against the textbook. Affirms correct parts, gently corrects misconceptions. Summarizes the key concept. |
+| Stage 3 | **Comprehension Check** | Asks ONE specific question to test understanding. The question is answerable from what the student just read. |
+| Stage 4 | **Final Feedback** | Evaluates the student's answer. Praises correct responses, explains incorrect ones with textbook references. Encourages exploring another topic. |
+
+### Curiosity Mode — 3-Stage Socratic Dialogue
+
+| Stage | Name | Tutor Behavior |
+|---|---|---|
+| Stage 1 | **Prior Knowledge** | "What do you already know about [topic]?" — Never gives the answer. |
+| Stage 2 | **Guided Question** | Gives brief feedback, asks ONE guiding follow-up question. Still doesn't give the answer. |
+| Stage 3 | **Conclusion** | Gives feedback, provides a clear concise explanation. Topic complete. |
 
 ---
 
@@ -86,15 +127,9 @@ Tutor:   "Hey there! Do you have a textbook you'd like to study with today?"
 │  ├── /live          Voice session (Pi↔Gemini)│
 │  ├── /upload        Mobile upload page       │
 │  ├── /upload-textbook  PDF processing        │
-│  ├── /upload-notify    Realtime notification │
-│  └── /wait-for-upload  Long-poll fallback    │
+│  └── /upload-notify    Realtime notification │
 │                                              │
-│  Phase-based state machine:                  │
-│  greeting → awaiting_mode → curiosity        │
-│                           → awaiting_upload  │
-│                             → textbook_ready │
-│                               → textbook     │
-│                                              │
+│  Phase-based state machine                   │
 │  RAG: page-aware textbook chunks             │
 │  Socratic system instructions per stage      │
 │                                              │
@@ -146,6 +181,7 @@ voice-study-companion/
 ├── live-server/                 # Cloud Run backend
 │   ├── main.py                  # FastAPI server, state machine, RAG, Gemini Live
 │   ├── upload.html              # Mobile upload page (served at /upload)
+│   ├── progress.html            # Learning progress dashboard (served at /progress)
 │   ├── requirements.txt         # Server dependencies
 │   └── Dockerfile               # Container config
 │
@@ -202,11 +238,17 @@ chmod +x deploy.sh   # Linux/Mac only
 
 On Windows, run the gcloud commands directly (no chmod needed).
 
-### 2. Verify Deployment
+### 2. Run Locally (for development)
 
-Open in browser:
-- `https://YOUR-URL/` → Should return JSON with `"status": "ok"`
-- `https://YOUR-URL/upload` → Should show the mobile upload page
+```bash
+cd live-server
+set GEMINI_API_KEY=your-api-key
+python -m uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+Verify:
+- `http://localhost:8080/` → Should return JSON with `"version": "v4"`
+- `http://localhost:8080/upload` → Should show the mobile upload page
 
 ### 3. Setup Raspberry Pi
 
@@ -240,27 +282,44 @@ python qr_upload.py
 **Start voice session:**
 ```bash
 python main.py
-# Press Enter to record, Enter again to stop
 # Say "Hey SocratiDesk" to begin
 ```
 
 ---
 
-## Conversation Phases (State Machine)
+## Learning Progress Dashboard
 
-| Phase | Trigger | Tutor Behavior |
-|---|---|---|
-| `greeting` | User says "Hi Socrati/Socratic" | Greets warmly, asks "Do you have a textbook?" |
-| `awaiting_mode` | After greeting | Listens for "yes" or "no" |
-| `awaiting_upload` | User says "yes" + no book uploaded | Says "Scan the QR code", Pi shows QR |
-| `textbook_ready` | Book uploaded or already available | Confirms book received, asks first question |
-| `curiosity_greeting` | User says "no" | Welcomes to curiosity mode, asks first question |
-| `textbook` (stage 1) | User asks a topic question | RAG retrieves pages, directs student to read |
-| `textbook` (stage 2) | Student shares understanding | Evaluates against textbook, asks guiding question |
-| `textbook` (stage 3) | Student answers again | Feedback + summary citing textbook pages |
-| `curiosity` (stage 1) | User asks a topic question | "What do you already know about [topic]?" |
-| `curiosity` (stage 2) | Student gives initial answer | Feedback + guiding follow-up question |
-| `curiosity` (stage 3) | Student answers again | Clear conclusion + optional next topic |
+After completing a topic, students can scan a QR code on the Pi screen to view their learning progress on their phone.
+
+**Access**: `https://YOUR-URL/progress?device_id=socratiDesk-001`
+
+### Features
+
+The dashboard has three tabs:
+
+| Tab | Content |
+|---|---|
+| **Summary** | AI-generated encouraging feedback — specific praise about what the student learned, how they engaged, and their progress |
+| **Knowledge** | Knowledge cards for each completed topic — key concepts as bullet points, with textbook page references when applicable |
+| **History** | Full conversation timeline showing each student-tutor exchange with phase and stage labels |
+
+### How It Works
+
+1. Student completes a 3-stage (curiosity) or 4-stage (textbook) dialogue
+2. Session data is stored on the server with topic, mode, and full conversation history
+3. When the student opens the progress page, Gemini generates a personalized summary
+4. The Pi TFT screen shows a QR code to the progress page after each completed topic
+
+### Header Stats
+
+The dashboard header shows at-a-glance metrics: topics studied, total conversation turns, session duration in minutes, and learning mode used.
+
+### Pi TFT Display
+
+During a session, the Pi's 1.14" TFT screen shows:
+- Current phase and stage (e.g., "Textbook mode Stage 2/4")
+- "Topic done! Scan for summary" with QR code after completion
+- "Say 'Hey Socrati'" when idle
 
 ---
 
@@ -273,35 +332,23 @@ python main.py
 5. **Persistence**: Chunks stored in Firestore (survives restarts) + in-memory (fast retrieval)
 6. **Retrieval**: When student asks a question, keyword search finds top-3 matching chunks
 7. **Injection**: Matching chunks (with page numbers) injected into Gemini's system instruction
-8. **Guidance**: Gemini references specific pages: "Open to page 5, you'll see..."
+8. **Guidance**: Gemini references specific pages: "Open to page 12, look at the middle section..."
 
 ---
 
-## Key Features for Competition
+## Audio & Silence Detection
 
-### "Beyond Text Box" (40% of score)
+The Pi client uses a dual-threshold system for reliable turn-taking:
 
-- **Voice-first**: No screen, no keyboard — pure voice interaction
-- **Barge-in**: Student can interrupt tutor mid-sentence (VAD enabled)
-- **Distinct persona**: "SocratiDesk" — warm, encouraging, never robotic
-- **QR scan flow**: Phone → scan → upload → voice session (seamless multimodal)
-- **Vision-ready**: WebSocket accepts image frames for "see homework" feature
+| Parameter | Value | Purpose |
+|---|---|---|
+| `SILENCE_THRESHOLD` | 500 | Raw RMS below this = silence (above mic floor noise ~280) |
+| `SPEECH_THRESHOLD` | 800 | Raw RMS above this = confirmed speech |
+| `SILENCE_TIMEOUT` | 2.0s | Duration of silence after speech to trigger auto-stop |
+| `MIN_RECORD_TIME` | 1.5s | Minimum recording time before auto-stop can trigger |
+| `MAX_GAIN` | 4.0x | Software gain applied to audio sent to Gemini (not used for silence detection) |
 
-### Technical Implementation (30% of score)
-
-- **Google GenAI SDK**: `client.aio.live.connect()` for streaming audio
-- **3 Google Cloud services**: Cloud Run + Firestore + GCS
-- **Secret Manager**: API key stored securely (not in env vars)
-- **RAG with grounding**: Page-aware textbook chunks prevent hallucination
-- **Automated deployment**: `deploy.sh` for IaC (competition bonus)
-- **Error handling**: Graceful fallbacks (Firestore optional, GCS optional, TFT optional)
-
-### Demo & Presentation (30% of score)
-
-- Architecture diagram included
-- Working demo on physical Raspberry Pi hardware
-- Both learning modes demonstrated end-to-end
-- Cloud deployment provable via GCP Console
+**Key design**: Silence detection uses **raw RMS** (before gain boost), preventing the gain from masking silence. Auto-stop only triggers after confirmed speech has been detected, preventing false stops when recording starts during silence.
 
 ---
 
@@ -309,11 +356,9 @@ python main.py
 
 | Input | Action |
 |---|---|
-| `Enter` | Start / stop recording |
-| `reset` | Reset topic (keep mode) |
+| `Enter` | Manual start / stop recording |
 | `new` | Full session reset (back to greeting) |
-| `mode curiosity` | Skip to curiosity mode directly |
-| `mode textbook` | Skip to textbook mode directly |
+| `reset` | Reset topic (keep mode) |
 | `books` | List uploaded textbooks |
 | `quit` | Exit |
 
@@ -330,13 +375,18 @@ Show diagram. Highlight: Gemini Live API, Cloud Run, Firestore, Raspberry Pi.
 **1:00–1:30 — QR upload flow**
 Run `qr_upload.py` → scan with phone → upload sample textbook → Pi confirms.
 
-**1:30–2:30 — Textbook Mode demo**
+**1:30–2:45 — Textbook Mode demo (4 stages)**
 "Hey SocratiDesk!" → "Yes I have a textbook" → "What is pH value?"
-Show all 3 stages: page reference → comprehension check → feedback.
+- Stage 1: Tutor directs to page, asks student to read
+- Stage 2: Student reports back, tutor gives feedback & summary
+- Stage 3: Tutor asks a comprehension question
+- Stage 4: Student answers, tutor gives final feedback
 
-**2:30–3:30 — Curiosity Mode demo**
+**2:45–3:30 — Curiosity Mode demo (3 stages)**
 `new` → "Hey SocratiDesk" → "No, just curious" → "What is a mammal?"
-Show all 3 stages. Demonstrate barge-in (interrupt tutor mid-sentence).
+- Stage 1: "What do you already know?"
+- Stage 2: Guiding question
+- Stage 3: Conclusion
 
 **3:30–4:00 — Impact**
 "SocratiDesk encourages reasoning over retrieval. It works for STEM, younger students, and hands-free learning environments."
@@ -347,24 +397,36 @@ Show all 3 stages. Demonstrate barge-in (interrupt tutor mid-sentence).
 
 | Issue | Fix |
 |---|---|
-| `API key not valid` | Check Secret Manager or `--set-env-vars`. Regenerate key at aistudio.google.com/apikey |
+| `API key not valid` | Set `GEMINI_API_KEY` env var. On Windows: `set GEMINI_API_KEY=xxx` |
+| Server shows old version | Make sure you replaced the file AND restarted uvicorn (no `--reload`) |
 | `Connection refused` on Pi | Verify `.env` URLs match your Cloud Run service URL |
-| `GPIO busy` on TFT | `sudo systemctl stop piscreen` then retry |
-| `UnicodeEncodeError` on Pi | `export PYTHONIOENCODING=utf-8` (add to `~/.bashrc`) |
-| No audio output | Check `aplay -l` for devices. Verify speaker is connected |
-| Upload page 404 | Redeploy — ensure `upload.html` is in `live-server/` next to `main.py` |
+| No auto-stop (keeps recording) | Check RMS values. If floor noise > 500, increase `SILENCE_THRESHOLD` |
+| Gemini doesn't respond | Check server logs for `>>> ActivityEnd`. If missing, `end_turn` was skipped |
+| Upload page 404 | Ensure `upload.html` is in `live-server/` next to `main.py` |
 | Textbook not found after upload | Upload goes to server RAM. If server restarted, re-upload |
 
 ---
 
-## Future Improvements
+## Key Features for Competition
 
-- Wake word detection ("Hey SocratiDesk" without pressing Enter)
-- Multi-topic memory across sessions
-- Emotion detection from voice tone (Gemini affective dialog)
-- Adaptive difficulty based on student performance
-- Learning progress tracking in Firestore
-- Vision mode: point camera at textbook page instead of uploading PDF
+### "Beyond Text Box" (40% of score)
+- **Voice-first**: No screen, no keyboard — pure voice interaction
+- **Barge-in**: Student can interrupt tutor mid-sentence
+- **Distinct persona**: "SocratiDesk" — warm, encouraging, never robotic
+- **QR scan flow**: Phone → scan → upload → voice session (seamless multimodal)
+
+### Technical Implementation (30% of score)
+- **Google GenAI SDK**: `client.aio.live.connect()` for streaming audio
+- **3 Google Cloud services**: Cloud Run + Firestore + GCS
+- **RAG with grounding**: Page-aware textbook chunks prevent hallucination
+- **Manual VAD**: ActivityStart/ActivityEnd for precise turn-taking
+- **Automated deployment**: `deploy.sh` for IaC (competition bonus)
+
+### Demo & Presentation (30% of score)
+- Architecture diagram included
+- Working demo on physical Raspberry Pi hardware
+- Both learning modes demonstrated end-to-end (4-stage textbook + 3-stage curiosity)
+- Cloud deployment provable via GCP Console
 
 ---
 
