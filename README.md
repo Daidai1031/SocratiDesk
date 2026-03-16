@@ -659,6 +659,19 @@ Run through this sequence:
 | Vosk never detects wake word | Wrong model path or model too small | Verify `VOSK_MODEL_PATH` points to a valid model |
 
 ---
+## Automated Cloud Deployment
+
+SocratiDesk includes an automated deployment script for Google Cloud Run.
+
+This script:
+- enables required Google Cloud APIs
+- provisions Cloud Storage and Firestore
+- builds the backend container
+- deploys the service to Cloud Run
+- outputs the final service URL for device configuration
+
+Deployment script:  
+[deploy.sh](https://github.com/Daidai1031/SocratiDesk/blob/main/deploy.sh)
 
 ## Acknowledgments
 
