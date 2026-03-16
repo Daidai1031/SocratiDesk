@@ -64,11 +64,9 @@ SocratiDesk summarizes the concept in simple language and connects the reasoning
 
 After each topic, a **mobile progress dashboard** — accessible via a QR code on the device’s display — shows:
 
-- AI-generated learning summaries  
-- highlighted key concepts  
+- AI-generated learning summaries (highlighted key concepts)
 - subject tags (Biology, Chemistry, Physics, etc.)  
 - full conversation history  
-- topic-based learning progress
 
 ## How we built it
 
@@ -163,9 +161,9 @@ Our architecture is optimized for minimal token usage:
 At scale with **Gemini's free tier** (15 RPM, 1M TPM), a single API key can support **5–10 students studying simultaneously** at zero cost — ideal for a classroom pilot.
 
 **Business model:**
-- **Phase 1 (Now)**: Open-source hardware kit + free Gemini API tier → schools build their own for $60
-- **Phase 2**: Pre-assembled device sold at $99 with 1 year of cloud service included
-- **Phase 3**: School district licensing at $5/student/month — cheaper than a single textbook, with AI-powered progress tracking for teachers
+- **version 1 (Now)**: Open-source hardware kit + free Gemini API tier → schools build their own for $60
+- **version 2**: Pre-assembled device sold at $99 with 1 year of cloud service included
+- **version 3**: School district licensing at $5/student/month — cheaper than a single textbook, with AI-powered progress tracking for teachers
 
 **Why this matters**: Existing EdTech AI tools (Khanmigo at $44/year, Duolingo Max at $168/year) are screen-based apps that compete with TikTok for attention. SocratiDesk is a dedicated physical device — when it's on the desk, the child is studying. No notifications, no tabs, no distractions.
 
