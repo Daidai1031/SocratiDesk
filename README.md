@@ -424,6 +424,242 @@ Run `qr_upload.py` → scan with phone → upload sample textbook → Pi confirm
 
 ---
 
+## Reproducible Testing
+
+This section explains how to verify that each component of SocratiDesk works correctly — from the API connection to the full voice loop. All tests can be run without a Raspberry Pi unless noted.
+
+### Prerequisites
+
+```bash
+# Clone the repo and install server dependencies
+cd live-server
+pip install -r requirements.txt
+
+# Set your Gemini API key
+export GEMINI_API_KEY=your-api-key          # Linux/Mac
+set GEMINI_API_KEY=your-api-key             # Windows CMD
+$env:GEMINI_API_KEY="your-api-key"          # Windows PowerShell
+```
+
+### Test 1 — Gemini API Connection
+
+Verify that your API key works and Gemini responds.
+
+```bash
+cd ..
+python test_gemini.py
+```
+
+**Expected**: A short paragraph explaining what a mammal is. If you see `API key not valid`, double-check your `GEMINI_API_KEY` environment variable.
+
+### Test 2 — Server Health Check
+
+Start the server locally and verify all endpoints.
+
+```bash
+cd live-server
+python -m uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+In a separate terminal:
+
+```bash
+# Root endpoint — should return JSON with version "v4"
+curl http://localhost:8080/
+# Expected: {"status":"ok","version":"v4","textbooks":[]}
+
+# Upload page — should return HTML
+curl -s http://localhost:8080/upload | head -5
+# Expected: <!DOCTYPE html> ...
+
+# Progress page — should return HTML
+curl -s "http://localhost:8080/progress?device_id=test" | head -5
+# Expected: <!DOCTYPE html> ...
+
+# Textbook list — should return empty list
+curl http://localhost:8080/textbooks
+# Expected: {"textbooks":[]}
+```
+
+### Test 3 — Textbook Upload & RAG Pipeline
+
+Upload a PDF and verify the chunking pipeline processes it correctly.
+
+```bash
+# Upload the sample textbook (or any PDF)
+curl -X POST -F "file=@k12_science_textbook.pdf" \
+  http://localhost:8080/upload-textbook
+
+# Expected response (values will vary):
+# {"status":"ok","book_id":"k12_science_textbook_pdf","name":"k12_science_textbook.pdf","pages":42,"chunks":187}
+
+# Verify the book appears in the list
+curl http://localhost:8080/textbooks
+# Expected: {"textbooks":[{"id":"k12_science_textbook_pdf","name":"k12_science_textbook.pdf","chunks":187,"pages":42}]}
+```
+
+**What to check**:
+- `status` is `"ok"`
+- `pages` > 0 (PDF was read successfully)
+- `chunks` > 0 (text was extracted and split)
+
+If `pages` is 0 or you get an error, the PDF may be scanned images without text. Try a different PDF with selectable text.
+
+### Test 4 — Socratic Chat Logic (Non-Voice)
+
+Test the 3-stage Socratic dialogue using the `/chat` endpoint in `app.py`. This uses the text-based tutor logic (not the Live API), useful for verifying the Socratic flow without audio.
+
+```bash
+# Start the text-based server
+cd ..
+python -m uvicorn app:app --host 0.0.0.0 --port 8081
+```
+
+```bash
+# Stage 1 — Initial question (tutor should ask what you already know)
+curl -X POST http://localhost:8081/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What is a mammal?"}'
+# Expected: reply asks "What do you already know about mammals?" (does NOT give the answer)
+# Save the session_id from the response
+
+# Stage 2 — Student responds (tutor gives feedback + guiding question)
+curl -X POST http://localhost:8081/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "SESSION_ID_FROM_ABOVE", "message": "I think mammals are animals with fur"}'
+# Expected: feedback on the answer + a follow-up question (still does NOT give the full answer)
+
+# Stage 3 — Student responds again (tutor gives conclusion)
+curl -X POST http://localhost:8081/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "SESSION_ID_FROM_ABOVE", "message": "They feed milk to their babies"}'
+# Expected: praise + clear final explanation of what a mammal is
+
+# Verify session state
+curl http://localhost:8081/session/SESSION_ID_FROM_ABOVE
+# Expected: found=true, stage=3, history contains 3 entries
+```
+
+**What to verify at each stage**:
+- Stage 1: Tutor acknowledges but does **not** define the term. Asks an open-ended question.
+- Stage 2: Tutor gives feedback, still withholds the full answer, asks a guiding question.
+- Stage 3: Tutor provides a clear, concise explanation.
+
+### Test 5 — WebSocket Live Session
+
+Test the real-time WebSocket connection that the Pi uses. This requires `websocat` or a similar WebSocket CLI tool.
+
+```bash
+# Install websocat (https://github.com/vi/websocat)
+# Mac: brew install websocat
+# Linux: cargo install websocat
+
+# Connect to the live WebSocket (server must be running on port 8080)
+websocat ws://localhost:8080/live?device_id=test-device
+```
+
+Type the following JSON messages and press Enter after each:
+
+```json
+{"type": "hello", "device": "test-device"}
+```
+
+**Expected response**: `{"type":"state","value":"ready"}` and `{"type":"phase","value":"idle"}`
+
+```json
+{"type": "set_phase", "phase": "greeting"}
+```
+
+**Expected**: `{"type":"phase","value":"greeting"}`
+
+```json
+{"type": "start_turn"}
+```
+
+**Expected**: `{"type":"state","value":"listening"}` followed by audio data (the greeting). You should see `{"type":"audio","data":"..."}` messages and eventually `{"type":"turn_complete"}`.
+
+Press `Ctrl+C` to disconnect.
+
+### Test 6 — Progress Dashboard
+
+After completing at least one Socratic dialogue via the WebSocket (or by manually inserting test data), verify the progress page works.
+
+```bash
+# Fetch progress data (returns JSON)
+curl "http://localhost:8080/progress-data?device_id=test-device"
+
+# If no sessions completed yet, expected:
+# {"topics":[],"stats":{"topics_studied":0,"total_turns":0,"duration_minutes":0,"mode":"—"},...}
+
+# Open in browser to see the visual dashboard:
+# http://localhost:8080/progress?device_id=test-device
+```
+
+### Test 7 — Raspberry Pi Hardware (On-Device)
+
+These tests require the actual Raspberry Pi with mic, speaker, and optional TFT display.
+
+**Microphone & RMS levels**:
+
+```bash
+cd pi-device
+python test_mic.py --duration 10
+```
+
+**What to check**:
+- Max RMS > 300 when speaking (mic is capturing audio)
+- Min RMS < 200 when silent (floor noise is reasonable)
+- Script prints a suggested `SILENCE_THRESHOLD` value
+
+**Vosk wake word detection** (requires Vosk model downloaded):
+
+```bash
+python test_mic.py --vosk ../models/vosk-model-small-en-us-0.15 --duration 15
+```
+
+Say "Hey Socrati" during the test. **Expected**: `WAKE WORD DETECTED!` appears in the output.
+
+**Full voice session**:
+
+```bash
+# Make sure .env is configured with your server URL
+python main.py
+```
+
+Run through this sequence:
+1. Say "Hey SocratiDesk" → should hear a greeting
+2. Say "No" → should enter curiosity mode
+3. Say "What is a mammal?" → should ask what you already know (Stage 1)
+4. Respond → should give feedback and ask a follow-up (Stage 2)
+5. Respond again → should give a conclusion (Stage 3)
+6. Type `new` + Enter → full reset
+7. Type `quit` + Enter → clean exit
+
+### Test Summary Checklist
+
+| # | Test | Command | Pass Criteria |
+|---|------|---------|---------------|
+| 1 | API connection | `python test_gemini.py` | Gets a text response from Gemini |
+| 2 | Server health | `curl localhost:8080/` | Returns `{"version":"v4"}` |
+| 3 | PDF upload | `curl -F file=@book.pdf localhost:8080/upload-textbook` | Returns `pages > 0, chunks > 0` |
+| 4 | Socratic flow | 3 sequential `/chat` calls | Stage 1 asks, Stage 2 guides, Stage 3 concludes |
+| 5 | WebSocket | `websocat ws://localhost:8080/live` | Receives `ready` state and audio on `start_turn` |
+| 6 | Progress | `curl localhost:8080/progress-data` | Returns valid JSON with stats |
+| 7 | Pi hardware | `python test_mic.py` | RMS > 300 when speaking |
+
+### Common Test Failures
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| `test_gemini.py` fails with key error | `GEMINI_API_KEY` not set | Export the env var in your current shell |
+| Server returns old version | Stale process | Kill old uvicorn, restart without `--reload` |
+| PDF upload returns `"error":"pdfplumber missing"` | Missing dependency | `pip install pdfplumber` |
+| WebSocket connects but no audio response | Gemini session failed to open | Check server logs for connection errors |
+| `test_mic.py` shows Max RMS < 100 | Mic not capturing | Run `arecord -l` to check device list |
+| Vosk never detects wake word | Wrong model path or model too small | Verify `VOSK_MODEL_PATH` points to a valid model |
+
+---
+
 ## Acknowledgments
 
 Built with:
