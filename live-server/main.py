@@ -6,7 +6,7 @@ Run: set GEMINI_API_KEY=xxx && python -m uvicorn main:app --host 0.0.0.0 --port 
 # ══════ VERSION CHECK — you MUST see this on startup ══════
 import sys
 print("=" * 60)
-print("  SocratiDesk Server v4  —  4-stage textbook mode")
+print("  SocratiDesk Server v4.1  —  3-stage textbook mode")
 print("=" * 60, flush=True)
 sys.stdout.flush()
 # ═══════════════════════════════════════════════════════════
@@ -126,7 +126,7 @@ textbook_store = TextbookStore()
 
 
 # ═══════════════════════════════════
-# System Instructions — 4-STAGE TEXTBOOK MODE
+# System Instructions — 3-STAGE TEXTBOOK MODE
 # ═══════════════════════════════════
 
 PERSONA = """You are SocratiDesk, a warm encouraging voice-first AI study companion.
@@ -176,57 +176,55 @@ Mode: Curiosity. Topic: {topic}. Stage 3/3.
 {ctx}
 Give feedback, then provide a clear concise explanation. 2-3 sentences."""
 
-    # ── TEXTBOOK MODE (4 stages) ──
+    # ── TEXTBOOK MODE (3 stages) ──
     if phase == PHASE_TEXTBOOK:
         pages = sorted(set(r["page"] for r in rag)) if rag else []
         page_str = ", ".join(str(p) for p in pages) or "?"
         rag_text = "\n---\n".join(f"[Page {r['page']}] {r['text']}" for r in rag) or "(no content found)"
-        ctx = "\n".join(f"Student: {h['user']}\nTutor: {h['tutor']}" for h in history[-4:]) or "No history."
+        ctx = "\n".join(f"Student: {h['user']}\nTutor: {h['tutor']}" for h in history[-3:]) or "No history."
         first_page = pages[0] if pages else "?"
 
         if stage == 1:
             return f"""{PERSONA}
-Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 1/4.
+Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 1/3 — PAGE DIRECTION.
 Relevant pages: {page_str}
-Content:
+Content from textbook:
 {rag_text}
 {ctx}
-TASK: Direct the student to the right page and section.
-Say: "Open to page {first_page}" and briefly describe where on the page to look (top/middle/bottom).
-Tell them what concept they'll find there and ask them to read it and tell you what they understand. 2-3 sentences."""
+TASK — The student just asked about "{topic}". DO NOT explain the answer.
+You MUST:
+1. Say "Great question! Open your book to page {first_page}."
+2. Tell them WHERE on the page to look: "Look at the [top/middle/bottom] of the page."
+3. Briefly describe what section or heading they'll see there (1 sentence).
+4. Say "Read that section and tell me what you found."
+IMPORTANT: Do NOT give the answer or explain the concept. Only direct them to the page.
+Keep it to 3 short sentences."""
 
         if stage == 2:
             return f"""{PERSONA}
-Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 2/4.
+Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 2/3 — FEEDBACK + ANSWER + QUESTION.
 Relevant pages: {page_str}
-Content:
+Content from textbook:
 {rag_text}
 {ctx}
-TASK: The student just shared what they read. Give feedback on their understanding.
-If correct, affirm and add context from the textbook. If incomplete, gently correct using the textbook content.
-Then summarize the key concept in your own simple words. 2-3 sentences."""
+TASK — The student just told you what they read. Do these 3 things:
+1. FEEDBACK: Tell them what they got right and what they missed. Be specific.
+2. ANSWER: Give a clear, simple explanation of the concept in everyday language. If they seem confused, use a simple analogy.
+3. QUESTION: Ask ONE simple comprehension question to check their understanding. Make it specific (e.g. "Is pH 7 acidic, basic, or neutral?").
+Keep it to 3-4 short sentences."""
 
-        if stage == 3:
-            return f"""{PERSONA}
-Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 3/4.
-Relevant pages: {page_str}
-Content:
-{rag_text}
-{ctx}
-TASK: Quick comprehension check. Ask ONE simple question to test if the student understood the concept.
-The question should be answerable from what they just read. Make it specific, not vague. 1-2 sentences."""
-
-        # stage 4
+        # stage 3
         return f"""{PERSONA}
-Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 4/4.
+Mode: Textbook. Book: "{book_name}". Topic: {topic}. Stage 3/3 — FINAL FEEDBACK & SUMMARY.
 Relevant pages: {page_str}
-Content:
+Content from textbook:
 {rag_text}
 {ctx}
-TASK: Final feedback. Evaluate the student's answer to the comprehension question.
-If correct, praise them and give a brief final summary citing page {first_page}.
-If incorrect, gently explain the right answer with a reference to the textbook.
-End by encouraging them to explore another topic. 2-3 sentences."""
+TASK — The student just answered the comprehension question. Do these things:
+1. If correct: praise them specifically. If incorrect: say "Not quite!" and give the right answer simply.
+2. Give a brief final summary of the key concept, citing page {first_page}.
+3. End with: "Great job! Want to explore another topic?"
+Keep it to 2-3 short sentences."""
 
     return f"{PERSONA}\nHelp the student."
 
@@ -285,11 +283,25 @@ class LiveSessionBridge:
         }
 
     async def _open(self, instruction: str):
-        self._live_cm = client.aio.live.connect(model=MODEL_NAME, config=self._build_config(instruction))
-        self._live_session = await self._live_cm.__aenter__()
-        self._recv_task = asyncio.create_task(self._recv_loop())
-        self._activity_started = False
-        print(f"[v4] Gemini session opened | phase={self.phase}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self._live_cm = client.aio.live.connect(model=MODEL_NAME, config=self._build_config(instruction))
+                self._live_session = await self._live_cm.__aenter__()
+                self._recv_task = asyncio.create_task(self._recv_loop())
+                self._activity_started = False
+                print(f"[v4] Gemini session opened | phase={self.phase}")
+                return
+            except Exception as e:
+                print(f"[v4] _open attempt {attempt+1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)  # 2s, 4s
+                    print(f"[v4] retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"[v4] _open failed after {max_retries} attempts")
+                    await self._send({"type": "error", "message": f"Gemini connection failed: {e}"})
+                    raise
 
     async def _close(self):
         current = asyncio.current_task()
@@ -316,6 +328,9 @@ class LiveSessionBridge:
                     if sc.input_transcription:
                         t = (sc.input_transcription.text or "").strip()
                         if t:
+                            # Add space between fragments
+                            if self._accumulated_user_text and not self._accumulated_user_text.endswith(" "):
+                                self._accumulated_user_text += " "
                             self._accumulated_user_text += t
                             self.current_user_text = self._accumulated_user_text
                             await self._send({"type": "user_transcript", "value": self._accumulated_user_text})
@@ -335,8 +350,11 @@ class LiveSessionBridge:
                         t = (sc.output_transcription.text or "").strip()
                         if t and t != self.last_tutor_sent:
                             self.last_tutor_sent = t
-                            self.current_tutor_text = t
-                            await self._send({"type": "tutor_transcript", "value": t})
+                            # Accumulate tutor transcript too
+                            if self.current_tutor_text and not self.current_tutor_text.endswith(" "):
+                                self.current_tutor_text += " "
+                            self.current_tutor_text += t
+                            await self._send({"type": "tutor_transcript", "value": self.current_tutor_text})
 
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
@@ -373,7 +391,7 @@ class LiveSessionBridge:
 
                         # Stage advancement
                         is_intro = (self.phase == PHASE_CURIOSITY and not self.topic and self.stage == 1)
-                        max_stage = 4 if self.phase == PHASE_TEXTBOOK else 3
+                        max_stage = 3  # Both textbook and curiosity are 3 stages now
                         was_final = (self.stage == max_stage and
                                      self.phase in (PHASE_TEXTBOOK, PHASE_CURIOSITY) and
                                      not is_intro and self._accumulated_user_text.strip())
@@ -420,14 +438,32 @@ class LiveSessionBridge:
     @staticmethod
     def _infer_topic(text: str) -> str:
         text = text.strip().lower()
-        for pfx in ["what is ","what are ","who is ","explain ","tell me about ",
-                     "how does ","how do ","why is ","define ",
+        # Remove common filler words
+        for filler in ["uh ", "um ", "uh, ", "um, ", "yeah, ", "yeah ", "so, ", "so ",
+                        "like ", "well ", "okay ", "ok "]:
+            if text.startswith(filler):
+                text = text[len(filler):]
+        text = text.strip()
+        # Strip question prefixes
+        for pfx in ["what is ","what are ","who is ","who are ",
+                     "explain ","tell me about ","how does ","how do ",
+                     "why is ","why are ","define ","describe ",
                      "i want to know about ","i want to learn about ",
-                     "i want to know what is ","i want to know ",
-                     "teach me about ","let's learn about ","tell me more about "]:
+                     "i want to know what is ","i want to know what are ",
+                     "i want to know ","i'd like to learn about ",
+                     "teach me about ","let's learn about ",
+                     "tell me more about ","can you explain ",
+                     "can you tell me about ","i'm curious about ",
+                     "what about "]:
             if text.startswith(pfx):
-                return text[len(pfx):].strip(" ?.!,")
-        return text.strip(" ?.!,") if len(text) >= 2 else ""
+                text = text[len(pfx):]
+                break
+        result = text.strip(" ?.!,")
+        # Remove trailing filler
+        for suffix in [" something", " stuff", " thing", " please"]:
+            if result.endswith(suffix):
+                result = result[:-len(suffix)].strip()
+        return result if len(result) >= 2 else ""
 
     async def _route_yes(self):
         if self._yes_no_detected: return
@@ -748,6 +784,14 @@ async def upload_textbook(file: UploadFile = File(...), device_id: str = "defaul
 @app.get("/textbooks")
 async def list_textbooks():
     return JSONResponse({"textbooks": textbook_store.list_books()})
+
+@app.get("/logo.png")
+async def logo_image():
+    from fastapi.responses import FileResponse
+    p = Path(__file__).parent / "logo.png"
+    if p.exists():
+        return FileResponse(p, media_type="image/png")
+    return JSONResponse({"error": "not found"}, 404)
 
 @app.get("/upload", response_class=HTMLResponse)
 async def upload_page():

@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>SocratiDesk — My Learning</title>
 <link href="https://fonts.googleapis.com/css2?family=Cabin+Sketch:wght@400;700&family=Patrick+Hand&display=swap" rel="stylesheet">
+<style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#faf8f5;--card:#fff;--text:#1a1612;--sub:#7a7064;
@@ -33,9 +34,8 @@ body{font-family:var(--font);color:var(--text);background:var(--bg);
 .hdr::after{content:'';position:absolute;bottom:-16px;left:0;right:0;height:32px;
   background:var(--bg);border-radius:16px 16px 0 0}
 .hdr-row{display:flex;align-items:center;gap:10px;margin-bottom:14px}
-.hdr-icon{width:36px;height:36px;border-radius:9px;background:rgba(255,255,255,.15);
+.hdr-icon{width:36px;height:36px;border-radius:9px;overflow:hidden;
   display:flex;align-items:center;justify-content:center}
-.hdr-icon svg{width:18px;height:18px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .hdr h1{font-family:var(--display);font-size:1.2rem;font-weight:600}
 /* 4 stats in one row */
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
@@ -137,7 +137,7 @@ body{font-family:var(--font);color:var(--text);background:var(--bg);
 
 <div class="hdr">
   <div class="hdr-row">
-    <div class="hdr-icon"><svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div>
+    <div class="hdr-icon"><img src="/logo.png" alt="" style="width:36px;height:36px;border-radius:9px;object-fit:cover;"></div>
     <h1>My Learning</h1>
   </div>
   <div class="stats" id="stats">

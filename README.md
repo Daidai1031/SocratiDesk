@@ -18,7 +18,7 @@ SocratiDesk is a dedicated voice-first AI study companion that sits on a student
 
 Two learning modes:
 - **Curiosity Mode** — Free exploration of any topic with a 3-stage Socratic dialogue
-- **Textbook Mode** — Guided study from an uploaded PDF with a 4-stage learning cycle
+- **Textbook Mode** — Guided study from an uploaded PDF with a 3-stage learning cycle
 
 The device has no keyboard, no browser, no distractions. Just a microphone, a speaker, and a small screen.
 
@@ -37,26 +37,22 @@ Tutor:   "Hey there! Do you have a textbook you'd like to study with today?"
          │  [Student scans, uploads PDF from phone]       │
          │  Tutor: "Got it! What topic shall we start?"   │
          │                                                │
-         │  → Textbook-Guided Mode (4 stages)             │
+         │  → Textbook-Guided Mode (3 stages)             │
          │                                                │
          │    Stage 1 — Page Direction:                   │
          │      "Open to page 12, look at the middle      │
          │       section. You'll find the pH scale there. │
-         │       Read it and tell me what you understand."│
+         │       Read it and tell me what you found."     │
          │                                                │
-         │    Stage 2 — Feedback & Summary:               │
-         │      "Good understanding! The textbook also    │
-         │       mentions that pH 7 is neutral. Acids     │
-         │       have pH below 7, bases above 7."         │
+         │    Stage 2 — Feedback + Answer + Question:     │
+         │      "Good! The textbook says pH 7 is neutral. │
+         │       Acids are below 7, bases above 7.        │
+         │       Quick check: is lemon juice acidic?"     │
          │                                                │
-         │    Stage 3 — Comprehension Check:              │
-         │      "Quick check — if lemon juice has a pH    │
-         │       of 2, is it an acid or a base?"          │
-         │                                                │
-         │    Stage 4 — Final Feedback:                   │
-         │      "That's right, lemon juice is acidic!     │
-         │       Great job understanding pH. Check page   │
-         │       12 for more on indicators!"              │
+         │    Stage 3 — Final Feedback & Summary:         │
+         │      "That's right! Lemon juice is acidic.     │
+         │       Great job understanding pH from page 12! │
+         │       Want to explore another topic?"          │
          │                                                │
          └────────────────────────────────────────────────┘
 
@@ -92,10 +88,9 @@ Tutor:   "Hey there! Do you have a textbook you'd like to study with today?"
 
 | Stage | Name | Tutor Behavior |
 |---|---|---|
-| Stage 1 | **Page Direction** | RAG retrieves relevant pages. Tutor tells student which page and section to open, describes what they'll find, asks them to read and report back. |
-| Stage 2 | **Feedback & Summary** | Evaluates student's understanding against the textbook. Affirms correct parts, gently corrects misconceptions. Summarizes the key concept. |
-| Stage 3 | **Comprehension Check** | Asks ONE specific question to test understanding. The question is answerable from what the student just read. |
-| Stage 4 | **Final Feedback** | Evaluates the student's answer. Praises correct responses, explains incorrect ones with textbook references. Encourages exploring another topic. |
+| Stage 1 | **Page Direction** | RAG retrieves relevant pages. Tutor tells student which page and section to open. Does NOT give the answer — only directs to the page. Asks student to read and report back. |
+| Stage 2 | **Feedback + Answer + Question** | Gives feedback on what student got right/wrong. Explains the concept in simple language. Asks ONE comprehension question to check understanding. |
+| Stage 3 | **Final Feedback & Summary** | Evaluates the student's answer. Gives final summary citing the textbook page. Encourages exploring another topic. |
 
 ### Curiosity Mode — 3-Stage Socratic Dialogue
 
@@ -305,7 +300,7 @@ The dashboard has three tabs:
 
 ### How It Works
 
-1. Student completes a 3-stage (curiosity) or 4-stage (textbook) dialogue
+1. Student completes a 3-stage (curiosity) or 3-stage (textbook) dialogue
 2. Session data is stored on the server with topic, mode, and full conversation history
 3. When the student opens the progress page, Gemini generates a personalized summary
 4. The Pi TFT screen shows a QR code to the progress page after each completed topic
@@ -317,7 +312,7 @@ The dashboard header shows at-a-glance metrics: topics studied, total conversati
 ### Pi TFT Display
 
 During a session, the Pi's 1.14" TFT screen shows:
-- Current phase and stage (e.g., "Textbook mode Stage 2/4")
+- Current phase and stage (e.g., "Textbook mode Stage 2/3")
 - "Topic done! Scan for summary" with QR code after completion
 - "Say 'Hey Socrati'" when idle
 
@@ -375,12 +370,11 @@ Show diagram. Highlight: Gemini Live API, Cloud Run, Firestore, Raspberry Pi.
 **1:00–1:30 — QR upload flow**
 Run `qr_upload.py` → scan with phone → upload sample textbook → Pi confirms.
 
-**1:30–2:45 — Textbook Mode demo (4 stages)**
+**1:30–2:45 — Textbook Mode demo (3 stages)**
 "Hey SocratiDesk!" → "Yes I have a textbook" → "What is pH value?"
-- Stage 1: Tutor directs to page, asks student to read
-- Stage 2: Student reports back, tutor gives feedback & summary
-- Stage 3: Tutor asks a comprehension question
-- Stage 4: Student answers, tutor gives final feedback
+- Stage 1: Tutor directs to page — does NOT give the answer
+- Stage 2: Student reports back, tutor gives feedback + answer + asks a question
+- Stage 3: Student answers, tutor gives final feedback and summary
 
 **2:45–3:30 — Curiosity Mode demo (3 stages)**
 `new` → "Hey SocratiDesk" → "No, just curious" → "What is a mammal?"
@@ -425,7 +419,7 @@ Run `qr_upload.py` → scan with phone → upload sample textbook → Pi confirm
 ### Demo & Presentation (30% of score)
 - Architecture diagram included
 - Working demo on physical Raspberry Pi hardware
-- Both learning modes demonstrated end-to-end (4-stage textbook + 3-stage curiosity)
+- Both learning modes demonstrated end-to-end (3-stage textbook + 3-stage curiosity)
 - Cloud deployment provable via GCP Console
 
 ---
