@@ -37,6 +37,7 @@ PHASE_GREETING        = "greeting"
 PHASE_AWAITING_MODE   = "awaiting_mode"
 PHASE_AWAITING_UPLOAD = "awaiting_upload"
 PHASE_TEXTBOOK_READY  = "textbook_ready"
+PHASE_TOPIC_CAPTURE   = "topic_capture"
 PHASE_TEXTBOOK        = "textbook"
 PHASE_CURIOSITY       = "curiosity"
 
@@ -315,8 +316,9 @@ class AssistantState:
             PHASE_AWAITING_MODE:   "Waiting for yes/no",
             PHASE_AWAITING_UPLOAD: "Waiting for PDF upload",
             PHASE_TEXTBOOK_READY:  "Textbook ready - ask a topic",
-            PHASE_TEXTBOOK:        f"Textbook study (stage {self.stage}/4)",
+            PHASE_TEXTBOOK:        f"Textbook study (stage {self.stage}/3)",
             PHASE_CURIOSITY:       f"Curiosity mode (stage {self.stage}/3)",
+            PHASE_TOPIC_CAPTURE:   "What topic? (listening)",
         }
         return labels.get(self.phase, self.phase)
 
@@ -620,7 +622,7 @@ async def receiver(ws, speaker, vosk):
 
             # Auto-start next recording AFTER audio finishes playing
             AUTO_LISTEN_PHASES = [
-                PHASE_GREETING, PHASE_AWAITING_MODE,
+                PHASE_GREETING, PHASE_AWAITING_MODE, PHASE_TOPIC_CAPTURE,
                 PHASE_TEXTBOOK_READY, PHASE_TEXTBOOK, PHASE_CURIOSITY,
             ]
             if state.phase in AUTO_LISTEN_PHASES and _ws_ref is not None:
@@ -648,7 +650,7 @@ def _handle_phase_ui(phase):
     elif phase == PHASE_TEXTBOOK_READY:
         tft.show_status("Textbook loaded!", "What topic?")
     elif phase == PHASE_TEXTBOOK:
-        tft.show_status("Textbook mode", f"Stage {state.stage}/4")
+        tft.show_status("Textbook mode", f"Stage {state.stage}/3")
     elif phase == PHASE_CURIOSITY:
         tft.show_status("Curiosity mode", f"Stage {state.stage}/3")
 
