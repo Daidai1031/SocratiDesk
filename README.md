@@ -195,6 +195,12 @@ voice-study-companion/
 ---
 
 ## Setup & Deployment
+### visual proof of Cloud deployment
+<p align="center">
+  <a href="https://youtu.be/_p_rQWRO_hs">
+    <img src="https://img.youtube.com/vi/_p_rQWRO_hs/maxresdefault.jpg" width="600">
+  </a>
+</p>
 
 ### Prerequisites
 
