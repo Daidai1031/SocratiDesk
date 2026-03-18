@@ -567,7 +567,7 @@ async def _wait_then_listen(ws):
         await asyncio.sleep(2)
         tft.show_qr(progress_url, label=["Scan for", "your learning", "summary!"])
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(20)
         tft.show_idle()
         if _vosk_ref is not None:
             _vosk_ref.resume()
