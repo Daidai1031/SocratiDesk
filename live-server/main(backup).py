@@ -431,8 +431,6 @@ class LiveSessionBridge:
         self._audio_msg_count = 0
         self._accumulated_user_text = ""
         self._topic_intercepted = False
-        self._stage1_pending = False
-        self._stage1_rag_pages = []
         self._live_cm = None
         self._live_session = None
         self._recv_task: Optional[asyncio.Task] = None
@@ -550,21 +548,21 @@ class LiveSessionBridge:
                                     await self._send({"type": "topic", "value": self.topic})
                                     await self._send({"type": "phase", "value": self.phase})
 
-                                    # Close the ASR session
+                                    # Close Gemini IMMEDIATELY — kill it before it speaks
                                     await self._close()
 
-                                    # Do deterministic Stage 1 with Gemini voice
+                                    # Do deterministic Stage 1 inline
                                     self.last_page_results = textbook_store.search_pages(self.topic, top_k=3)
                                     rag_pages = sorted(set(r["page"] for r in self.last_page_results))
-                                    print(f"[v5.1] === DETERMINISTIC STAGE 1 (early, Gemini voice) === pages={rag_pages}")
+                                    print(f"[v5.1] === DETERMINISTIC STAGE 1 (early) === pages={rag_pages}")
 
                                     message = build_stage1_message(
                                         self.topic, self.last_page_results, self.active_book_name)
                                     print(f"[v5.1] Stage 1 message: {message}")
 
+                                    await self._send({"type": "tts_speak", "text": message})
                                     await self._send({"type": "tutor_transcript", "value": message})
 
-                                    # Record in history
                                     self.history.append({
                                         "turn": self.turn_count,
                                         "user": self._accumulated_user_text,
@@ -573,34 +571,19 @@ class LiveSessionBridge:
                                         "stage": self.stage,
                                     })
 
-                                    # Open Gemini as voice reader (no textbook context)
-                                    reader_instruction = (
-                                        "You are a friendly voice reading a script out loud to a student. "
-                                        "Read the user's message exactly as written, word for word. "
-                                        "Use a warm, encouraging tone. "
-                                        "Do NOT add anything. Do NOT explain anything. Do NOT improvise. "
-                                        "Do NOT answer any questions. Just read the script naturally."
-                                    )
-                                    self._stage1_pending = True
-                                    self._stage1_rag_pages = rag_pages
-                                    await self._open(reader_instruction)
-                                    if self._live_session:
-                                        try:
-                                            await self._live_session.send_client_content(
-                                                turns=[{"role": "user",
-                                                        "parts": [{"text": f"Read this aloud: {message}"}]}],
-                                                turn_complete=True)
-                                            print(f"[v5.1] Stage 1: sent script to Gemini voice reader")
-                                        except Exception as e:
-                                            print(f"[v5.1] voice reader error: {e}")
-                                            await self._close()
-                                            self._stage1_pending = False
-                                            # Fallback to local TTS
-                                            await self._send({"type": "tts_speak", "text": message})
-                                            self.stage = 2
-                                            await self._send({"type": "state", "value": "ready"})
-                                            await self._send({"type": "turn_complete"})
-                                    return  # EXIT recv_loop — new recv_loop handles voice reader
+                                    self.stage = 2
+                                    await self._send({"type": "phase", "value": self.phase})
+                                    await self._send({"type": "turn_meta",
+                                                      "turn": self.turn_count,
+                                                      "phase": self.phase,
+                                                      "stage": self.stage,
+                                                      "topic": self.topic,
+                                                      "textbook_pages": rag_pages,
+                                                      "topic_complete": False})
+                                    await self._send({"type": "state", "value": "ready"})
+                                    await self._send({"type": "turn_complete"})
+                                    print(f"[v5.1] Stage 1 complete (early intercept) → stage={self.stage}")
+                                    return  # EXIT recv_loop
 
                     # ═══════════════════════════════════════════════
                     # TOPIC CAPTURE: Suppress ALL Gemini output.
@@ -635,32 +618,7 @@ class LiveSessionBridge:
                                     await self._flush_audio()
 
                     if sc.generation_complete:
-                        print(f"[v5.1] generation_complete turn {self.turn_count}, user={self._accumulated_user_text!r}")
-
-                        # ═══════════════════════════════════════════════
-                        # STAGE 1 VOICE READER COMPLETE
-                        # Gemini just finished reading the page direction script.
-                        # Advance to stage 2 and complete the turn.
-                        # ═══════════════════════════════════════════════
-                        if self._stage1_pending:
-                            self._stage1_pending = False
-                            await self._flush_audio(force=True)
-                            self.stage = 2
-                            rag_pages = self._stage1_rag_pages
-                            await self._close()
-                            print(f"[v5.1] Stage 1 voice reader done → stage={self.stage}")
-
-                            await self._send({"type": "phase", "value": self.phase})
-                            await self._send({"type": "turn_meta",
-                                              "turn": self.turn_count,
-                                              "phase": self.phase,
-                                              "stage": self.stage,
-                                              "topic": self.topic,
-                                              "textbook_pages": rag_pages,
-                                              "topic_complete": False})
-                            await self._send({"type": "state", "value": "ready"})
-                            await self._send({"type": "turn_complete"})
-                            return
+                        print(f"[v5.0] generation_complete turn {self.turn_count}, user={self._accumulated_user_text!r}")
 
                         # For topic_capture: do NOT flush audio (it was suppressed)
                         if self.phase != PHASE_TOPIC_CAPTURE:
@@ -679,8 +637,8 @@ class LiveSessionBridge:
 
                         # ═══════════════════════════════════════════════
                         # TOPIC CAPTURE → DETERMINISTIC STAGE 1
-                        # Extract topic, close ASR session, open Gemini
-                        # voice reader for consistent audio quality
+                        # Extract topic, close Gemini, send tts_speak
+                        # ALL within this turn — no separate begin_turn
                         # ═══════════════════════════════════════════════
                         elif self.phase == PHASE_TOPIC_CAPTURE and full:
                             raw_topic = self._infer_topic(full)
@@ -694,55 +652,48 @@ class LiveSessionBridge:
                                 self.phase = PHASE_TEXTBOOK
                                 await self._send({"type": "topic", "value": self.topic})
                                 await self._send({"type": "phase", "value": self.phase})
-                                print(f"[v5.1] topic_capture (fallback) → topic={self.topic!r}")
+                                print(f"[v5.0] topic_capture → topic={self.topic!r}")
 
+                                # Close Gemini FIRST — prevent any further output
                                 await self._close()
 
+                                # Now do deterministic Stage 1 inline
                                 self.last_page_results = textbook_store.search_pages(self.topic, top_k=3)
                                 rag_pages = sorted(set(r["page"] for r in self.last_page_results))
-                                print(f"[v5.1] === DETERMINISTIC STAGE 1 (fallback, Gemini voice) === pages={rag_pages}")
+                                print(f"[v5.0] === DETERMINISTIC STAGE 1 (inline) === pages={rag_pages}")
 
                                 message = build_stage1_message(
                                     self.topic, self.last_page_results, self.active_book_name)
-                                print(f"[v5.1] Stage 1 message: {message}")
+                                print(f"[v5.0] Stage 1 message: {message}")
 
+                                # Send deterministic TTS to Pi
+                                await self._send({"type": "tts_speak", "text": message})
                                 await self._send({"type": "tutor_transcript", "value": message})
 
+                                # Record in history
                                 self.history.append({
                                     "turn": self.turn_count,
                                     "user": self._accumulated_user_text,
-                                    "tutor": message,
+                                    "tutor": message,  # deterministic message, not Gemini output
                                     "phase": self.phase,
                                     "stage": self.stage,
                                 })
 
-                                # Open Gemini voice reader
-                                reader_instruction = (
-                                    "You are a friendly voice reading a script out loud to a student. "
-                                    "Read the user's message exactly as written, word for word. "
-                                    "Use a warm, encouraging tone. "
-                                    "Do NOT add anything. Do NOT explain anything. Do NOT improvise. "
-                                    "Do NOT answer any questions. Just read the script naturally."
-                                )
-                                self._stage1_pending = True
-                                self._stage1_rag_pages = rag_pages
-                                await self._open(reader_instruction)
-                                if self._live_session:
-                                    try:
-                                        await self._live_session.send_client_content(
-                                            turns=[{"role": "user",
-                                                    "parts": [{"text": f"Read this aloud: {message}"}]}],
-                                            turn_complete=True)
-                                        print(f"[v5.1] Stage 1 fallback: sent to Gemini voice reader")
-                                    except Exception as e:
-                                        print(f"[v5.1] voice reader fallback error: {e}")
-                                        await self._close()
-                                        self._stage1_pending = False
-                                        await self._send({"type": "tts_speak", "text": message})
-                                        self.stage = 2
-                                        await self._send({"type": "state", "value": "ready"})
-                                        await self._send({"type": "turn_complete"})
-                                return  # EXIT — new recv_loop handles voice reader
+                                # Advance to stage 2
+                                self.stage = 2
+
+                                await self._send({"type": "phase", "value": self.phase})
+                                await self._send({"type": "turn_meta",
+                                                  "turn": self.turn_count,
+                                                  "phase": self.phase,
+                                                  "stage": self.stage,
+                                                  "topic": self.topic,
+                                                  "textbook_pages": rag_pages,
+                                                  "topic_complete": False})
+                                await self._send({"type": "state", "value": "ready"})
+                                await self._send({"type": "turn_complete"})
+                                print(f"[v5.0] Stage 1 complete (inline) → stage={self.stage}")
+                                return  # EXIT recv_loop — turn is fully done
 
                         self.history.append({
                             "turn": self.turn_count,
@@ -938,70 +889,55 @@ class LiveSessionBridge:
         print(f"[v5.0] yes/no handled → {self.phase}")
 
     async def _handle_textbook_stage1(self):
-        """Deterministic textbook Stage 1 with Gemini voice.
+        """Deterministic textbook Stage 1: no Gemini, pure application logic.
         1. Retrieve page locations (not full content)
-        2. Build fixed message (application logic)
-        3. Use Gemini ONLY as a voice reader — no textbook context given
+        2. Build fixed message
+        3. Send as tts_speak to Pi for local TTS playback
         4. Advance stage and complete turn
-        
-        Key safety: The system instruction tells Gemini to read a script.
-        The script contains ONLY page directions, no answers.
-        Gemini receives ZERO textbook content — it literally cannot explain
-        anything because it has no knowledge of the textbook.
         """
-        print(f"[v5.1] === DETERMINISTIC STAGE 1 (Gemini voice) === topic={self.topic!r}")
+        print(f"[v5.0] === DETERMINISTIC STAGE 1 === topic={self.topic!r}")
 
         # Stage 1 retrieval: page locator only (no content)
         self.last_page_results = textbook_store.search_pages(self.topic, top_k=3)
         rag_pages = sorted(set(r["page"] for r in self.last_page_results))
-        print(f"[v5.1] Stage 1 page results: {rag_pages}")
+        print(f"[v5.0] Stage 1 page results: {rag_pages}")
 
-        # Build deterministic message (pure application logic)
+        # Build deterministic message
         message = build_stage1_message(
             self.topic, self.last_page_results, self.active_book_name)
-        print(f"[v5.1] Stage 1 message: {message}")
+        print(f"[v5.0] Stage 1 message: {message}")
 
-        # Send as tutor transcript for display
+        # Send deterministic text to Pi for local TTS
+        # This is NOT sent to Gemini — Pi will use its own TTS engine
+        await self._send({"type": "tts_speak", "text": message})
+
+        # Also send as tutor transcript for display
         await self._send({"type": "tutor_transcript", "value": message})
-
-        # Open Gemini session as VOICE READER ONLY
-        # Critical: NO textbook content in system instruction
-        reader_instruction = (
-            "You are a friendly voice reading a script out loud to a student. "
-            "Read the user's message exactly as written, word for word. "
-            "Use a warm, encouraging tone. "
-            "Do NOT add anything. Do NOT explain anything. Do NOT improvise. "
-            "Do NOT answer any questions. Just read the script naturally."
-        )
-        await self._open(reader_instruction)
-
-        # Send the fixed text as user message for Gemini to read aloud
-        if self._live_session:
-            try:
-                await self._live_session.send_client_content(
-                    turns=[{"role": "user", "parts": [{"text": f"Read this aloud: {message}"}]}],
-                    turn_complete=True)
-                print(f"[v5.1] Stage 1: sent script to Gemini voice reader")
-            except Exception as e:
-                print(f"[v5.1] Stage 1 voice reader error: {e}")
-                # Fallback to local TTS if Gemini fails
-                await self._close()
-                await self._send({"type": "tts_speak", "text": message})
 
         # Record in history
         self.history.append({
             "turn": self.turn_count,
-            "user": "",
+            "user": "",  # No user input for speak-first turn
             "tutor": message,
             "phase": self.phase,
             "stage": self.stage,
         })
 
-        # NOTE: Don't advance stage here — let _recv_loop do it
-        # when Gemini finishes speaking (generation_complete).
-        # Store the target stage so _recv_loop knows this was Stage 1.
-        self._stage1_pending = True
-        self._stage1_rag_pages = rag_pages
+        # Advance to stage 2
+        self.stage = 2
+
+        # Send turn completion signals
+        await self._send({"type": "phase", "value": self.phase})
+        await self._send({"type": "turn_meta",
+                          "turn": self.turn_count,
+                          "phase": self.phase,
+                          "stage": self.stage,
+                          "topic": self.topic,
+                          "textbook_pages": rag_pages,
+                          "topic_complete": False})
+        await self._send({"type": "state", "value": "ready"})
+        await self._send({"type": "turn_complete"})
+        print(f"[v5.0] Stage 1 complete → stage={self.stage}")
 
     async def begin_turn(self):
         self.turn_count += 1
