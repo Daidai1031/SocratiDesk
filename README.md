@@ -23,6 +23,13 @@ Two learning modes:
 The device has no keyboard, no browser, no distractions. Just a microphone, a speaker, and a small screen.
 
 ---
+## Demo Video
+[![Watch the demo](https://img.youtube.com/vi/TNkHT_lynAg/maxresdefault.jpg)](https://www.youtube.com/watch?v=TNkHT_lynAg)
+
+<p align="center">
+  Click the preview image to watch the full demo on YouTube.
+</p>
+
 
 ## User Flow
 
